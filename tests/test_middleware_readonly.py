@@ -30,7 +30,6 @@ from tests.tools._spyclient import SpyClient
 
 def test_is_read_only_disabled_by_default(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("PLANE_READ_ONLY", raising=False)
-    monkeypatch.delenv("PLANE_MCP_READ_ONLY", raising=False)
     assert is_read_only() is False
 
 
@@ -46,21 +45,8 @@ def test_is_read_only_falsy_values(monkeypatch: pytest.MonkeyPatch, val: str):
     assert is_read_only() is False
 
 
-def test_is_read_only_legacy_alias_env_var(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv("PLANE_READ_ONLY", raising=False)
-    monkeypatch.setenv("PLANE_MCP_READ_ONLY", "true")
-    assert is_read_only() is True
-
-
-def test_plane_read_only_precedence_over_legacy(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("PLANE_READ_ONLY", "false")
-    monkeypatch.setenv("PLANE_MCP_READ_ONLY", "true")
-    assert is_read_only() is False
-
-
 def test_server_configured_without_read_only_middleware_by_default(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("PLANE_READ_ONLY", raising=False)
-    monkeypatch.delenv("PLANE_MCP_READ_ONLY", raising=False)
 
     mcp = FastMCP("test")
     _configured(mcp)
@@ -152,7 +138,7 @@ def test_unrecognised_tool_is_safely_blocked(middleware: PlaneReadOnlyMiddleware
 
 
 def test_malformed_and_missing_arguments_safely_handled(middleware: PlaneReadOnlyMiddleware):
-    """Ensure no exceptions occur when arguments are None, not a dict, or missing action."""
+    """Ensure no exceptions occur when arguments are None, not a dict, or missing/malformed action."""
     assert middleware.rejection("workitem", None) == "Error: Plane MCP read-only mode blocks workitem.unknown."
     assert middleware.rejection("workitem", {}) == "Error: Plane MCP read-only mode blocks workitem.unknown."
     assert (
@@ -160,6 +146,26 @@ def test_malformed_and_missing_arguments_safely_handled(middleware: PlaneReadOnl
     )
     assert (
         middleware.rejection("workitem", {"action": 123}) == "Error: Plane MCP read-only mode blocks workitem.unknown."
+    )
+    assert (
+        middleware.rejection("workitem", {"action": ["create", "delete"]})
+        == "Error: Plane MCP read-only mode blocks workitem.unknown."
+    )
+    assert (
+        middleware.rejection("workitem", {"action": {"nested": "dict"}})
+        == "Error: Plane MCP read-only mode blocks workitem.unknown."
+    )
+    assert (
+        middleware.rejection("workitem", {"action": set()})
+        == "Error: Plane MCP read-only mode blocks workitem.unknown."
+    )
+    assert middleware.rejection("workitem", {"action": 0}) == "Error: Plane MCP read-only mode blocks workitem.unknown."
+    assert (
+        middleware.rejection("workitem", {"action": False})
+        == "Error: Plane MCP read-only mode blocks workitem.unknown."
+    )
+    assert (
+        middleware.rejection("workitem", {"action": ""}) == "Error: Plane MCP read-only mode blocks workitem.unknown."
     )
     assert (
         middleware.rejection("workitem", {"action": "not_an_action"})
@@ -223,11 +229,35 @@ async def test_read_only_mode_blocks_writes_before_sdk(monkeypatch: pytest.Monke
     write_calls = [
         ("workitem", {"action": "create", "project_id": "p1", "name": "Test Item"}),
         ("workitem", {"action": "delete", "project_id": "p1", "workitem_id": "w1"}),
+        ("workitem", {"action": "archive", "project_id": "p1", "workitem_id": "w1"}),
         ("project", {"action": "update", "project_id": "p1", "name": "Updated"}),
         ("cycle", {"action": "create", "project_id": "p1", "name": "Sprint 1", "owned_by": "u1"}),
         ("label", {"action": "delete", "project_id": "p1", "label_id": "l1"}),
+        ("customer", {"action": "create", "name": "Acme Corp"}),
+        ("milestone", {"action": "create", "project_id": "p1", "title": "v1.0"}),
+        ("module", {"action": "archive", "project_id": "p1", "module_id": "m1"}),
+        ("page", {"action": "create", "name": "New Page"}),
+        (
+            "workitem_attachment",
+            {
+                "action": "upload_from_url",
+                "project_id": "p1",
+                "workitem_id": "w1",
+                "url": "https://example.com/file.png",
+            },
+        ),
+        (
+            "workitem_comment",
+            {"action": "create", "project_id": "p1", "workitem_id": "w1", "comment_html": "<p>test</p>"},
+        ),
+        ("workitem_type", {"action": "resolve", "project_id": "p1", "name": "Bug"}),
+        ("workspace", {"action": "update_features"}),
         ("create_issue", {"project_id": "p1", "name": "Legacy Issue"}),
         ("delete_issue", {"project_id": "p1", "work_item_id": "w1"}),
+        # Malformed / unhashable action values must be cleanly rejected before the SDK
+        ("workitem", {"action": ["create", "delete"], "project_id": "p1"}),
+        ("workitem", {"action": {"nested": "dict"}, "project_id": "p1"}),
+        ("workitem", {"action": 12345, "project_id": "p1"}),
     ]
 
     async with Client(server) as client:
@@ -271,7 +301,6 @@ async def test_read_only_mode_permits_reads_to_sdk(monkeypatch: pytest.MonkeyPat
 async def test_disabled_by_default_permits_writes(monkeypatch: pytest.MonkeyPatch, spy: SpyClient):
     """When disabled, write operations pass through the middleware stack to the SDK."""
     monkeypatch.delenv("PLANE_READ_ONLY", raising=False)
-    monkeypatch.delenv("PLANE_MCP_READ_ONLY", raising=False)
     monkeypatch.setenv("PLANE_API_KEY", "test-key")
     monkeypatch.setenv("PLANE_WORKSPACE_SLUG", "test-ws")
 

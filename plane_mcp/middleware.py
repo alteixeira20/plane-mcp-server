@@ -60,7 +60,7 @@ class ValidateActionArguments(Middleware):
             # that omitted the choice learns nothing it did not already know.
             return missing_action_error(tool, by_action)
         action = arguments["action"]
-        if action not in by_action:
+        if not isinstance(action, str) or action not in by_action:
             # A present-but-wrong action is left alone: the Literal already reports
             # the permitted set, and a second opinion here would only muddle it.
             return None
