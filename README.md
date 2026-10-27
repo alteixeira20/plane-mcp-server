@@ -145,9 +145,25 @@ unchanged.
 | `PLANE_API_KEY` | stdio | API key |
 | `PLANE_WORKSPACE_SLUG` | stdio | Target workspace |
 | `PLANE_BASE_URL` | optional | Plane API URL (default `https://api.plane.so`) |
+| `PLANE_READ_ONLY` | optional | When `true`, restrict operations strictly to read actions (default `false`) |
 
 The remote transports carry credentials in the connection — the OAuth flow or the
 PAT headers — and need none of these.
+
+### Read-only mode
+
+To prevent tools from creating, mutating or deleting records (e.g. for audit, monitoring or untrusted agent sessions), enable `PLANE_READ_ONLY`:
+
+```bash
+export PLANE_READ_ONLY=true
+```
+
+When enabled, operations marked `read=True` (e.g. `list`, `retrieve`, `count`, `search`, `worklog_summary`) execute normally, while any mutation, write or deletion action (e.g. `create`, `update`, `delete`, `archive`) is refused before invoking the Plane SDK. Refusals return an explicit message without modifying advertised tool definitions or invalidating client prompt caches:
+
+```
+Error: Plane MCP read-only mode blocks workitem.create.
+```
+
 
 ### Outbound proxy for attachment uploads
 

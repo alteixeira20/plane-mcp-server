@@ -11,7 +11,7 @@ from fastmcp.tools.tool import ToolResult
 from fastmcp.utilities.logging import get_logger
 
 from plane_mcp.coercion import coerce_arguments
-from plane_mcp.tools.registry import action_arguments, alias_table
+from plane_mcp.tools.registry import RESOURCES, action_arguments, alias_table
 
 logger = get_logger(__name__)
 
@@ -153,3 +153,49 @@ class PlaneLoggingMiddleware(StructuredLoggingMiddleware):
 
     def _create_error_message(self, context: MiddlewareContext, start_time: float, error: Exception) -> dict:
         return super()._create_error_message(context, start_time, error) | self._operation(context)
+
+
+class PlaneReadOnlyMiddleware(Middleware):
+    """Refuse any MCP operation not explicitly marked read=True."""
+
+    def __init__(
+        self,
+        allowed: dict[str, dict[str, bool]] | None = None,
+        aliases: dict[str, tuple[str, str]] | None = None,
+    ) -> None:
+        self._allowed: dict[str, dict[str, bool]] = (
+            allowed if allowed is not None else {mod.NAME: {a.name: a.read for a in mod.ACTIONS} for mod in RESOURCES}
+        )
+        self._aliases: dict[str, tuple[str, str]] = aliases if aliases is not None else alias_table()
+
+    def rejection(self, tool: str, arguments: dict[str, Any] | None) -> str | None:
+        """Return a refusal message, or None for an explicitly read-only action."""
+        if tool in self._aliases:
+            resource, action = self._aliases[tool]
+        else:
+            resource = tool
+            args = arguments if isinstance(arguments, dict) else {}
+            action = args.get("action")
+
+        known = self._allowed.get(resource)
+        if known is None:
+            return f"Error: Plane MCP read-only mode blocks an unrecognised tool '{tool}'."
+
+        if action is None and len(known) == 1:
+            action = next(iter(known))
+
+        if not isinstance(action, str) or not known.get(action, False):
+            # Deliberately do not echo arguments, which might contain private data.
+            action_desc = action if isinstance(action, str) and action else "unknown"
+            return f"Error: Plane MCP read-only mode blocks {resource}.{action_desc}."
+        return None
+
+    async def on_call_tool(self, context: MiddlewareContext, call_next):
+        """Reject before the corresponding tool runs; never dispatch a write."""
+        message = context.message
+        name = getattr(message, "name", "")
+        args = getattr(message, "arguments", None)
+        if reason := self.rejection(name, args):
+            logger.warning("Plane MCP: read-only policy blocked call to %s", name)
+            return ToolResult(content=reason)
+        return await call_next(context)

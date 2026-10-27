@@ -9,7 +9,12 @@ from mcp.types import Icon
 
 from plane_mcp.auth import PlaneHeaderAuthProvider, PlaneOAuthProvider
 from plane_mcp.instructions import SERVER_INSTRUCTIONS
-from plane_mcp.middleware import CoerceArguments, PlaneLoggingMiddleware, ValidateActionArguments
+from plane_mcp.middleware import (
+    CoerceArguments,
+    PlaneLoggingMiddleware,
+    PlaneReadOnlyMiddleware,
+    ValidateActionArguments,
+)
 from plane_mcp.storage import build_token_store
 from plane_mcp.tools import register_tools
 
@@ -54,11 +59,22 @@ def get_allowed_client_redirect_uris() -> list[str]:
 LOG_PAYLOADS = os.getenv("LOG_PAYLOADS", "true").lower() == "true"
 
 
+def is_read_only() -> bool:
+    """True when read-only mode is explicitly enabled by environment variable."""
+    return os.getenv("PLANE_READ_ONLY", os.getenv("PLANE_MCP_READ_ONLY", "false")).lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+
 def _configured(mcp: FastMCP) -> FastMCP:
     """The middleware stack and tools every transport shares."""
     mcp.add_middleware(PlaneLoggingMiddleware(include_payloads=LOG_PAYLOADS))
     mcp.add_middleware(CoerceArguments())
     mcp.add_middleware(ValidateActionArguments())
+    if is_read_only():
+        mcp.add_middleware(PlaneReadOnlyMiddleware())
     register_tools(mcp)
     return mcp
 
