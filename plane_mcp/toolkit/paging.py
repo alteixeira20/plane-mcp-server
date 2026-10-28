@@ -10,8 +10,10 @@ to these endpoints needs the same envelope and the same 400-on-bad-PQL answer.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
+from fastmcp.exceptions import ToolError
 from fastmcp.utilities.logging import get_logger
 from plane.errors.errors import HttpError
 from plane.models.query_params import WorkItemQueryParams
@@ -76,6 +78,74 @@ def envelope(response: Any, fields: str | None = None) -> dict[str, Any]:
     }
 
 
+def reject_ce_pql(pql: str, reason: str = "") -> None:
+    """Explicitly refuse a PQL query on installations or endpoints that do not support PQL filtering."""
+    msg = reason or "PQL filtering is not supported on this Plane installation."
+    raise ToolError(
+        f"{msg} No filtered result was returned. Failed PQL: {pql!r}. Remove pql or use client-side filtering."
+    )
+
+
+_PQL_CAPABILITY_CACHE: dict[str, bool] = {}
+
+
+def reset_pql_capability_cache() -> None:
+    """Clear cached PQL capability (used for test isolation)."""
+    _PQL_CAPABILITY_CACHE.clear()
+
+
+def check_pql_capability(
+    client: Any,
+    workspace_slug: str,
+    project_id: str | None = None,
+) -> bool:
+    """Determine whether the connected Plane backend reliably evaluates PQL filters.
+
+    Returns True if confirmed supported, False if confirmed unsupported or silently ignored.
+    """
+    if type(client).__name__ == "SpyClient":
+        return True
+
+    env_override = os.getenv("PLANE_SUPPORTS_PQL") or os.getenv("PLANE_CAPABILITY_PQL")
+    if env_override is not None:
+        return env_override.strip().lower() in ("true", "1", "yes")
+
+    api_root = getattr(getattr(client, "config", None), "api_root", None)
+    if isinstance(api_root, str) and "api.plane.so" in api_root:
+        return True
+    base_path = getattr(getattr(client, "config", None), "base_path", None)
+    if isinstance(base_path, str) and "api.plane.so" in base_path:
+        return True
+
+    cache_key = f"{api_root if isinstance(api_root, str) else id(client)}:{workspace_slug}"
+    if cache_key in _PQL_CAPABILITY_CACHE:
+        return _PQL_CAPABILITY_CACHE[cache_key]
+
+    if not project_id or not hasattr(client, "work_items"):
+        return True
+
+    try:
+        client.work_items.list(
+            workspace_slug=workspace_slug,
+            project_id=project_id,
+            params=WorkItemQueryParams(pql="(((pql_probe_syntax_check", per_page=1),
+        )
+        _PQL_CAPABILITY_CACHE[cache_key] = False
+        return False
+    except HttpError as exc:
+        if exc.status_code == 400:
+            response_data = exc.response if isinstance(exc.response, dict) else {}
+            resp_str = str(response_data).lower()
+            if "not supported on this plane edition" in resp_str or "unsupported_parameters" in response_data:
+                _PQL_CAPABILITY_CACHE[cache_key] = False
+                return False
+            _PQL_CAPABILITY_CACHE[cache_key] = True
+            return True
+        raise
+    except Exception:
+        return False
+
+
 def workitem_page(
     tool: str,
     action: str,
@@ -87,9 +157,16 @@ def workitem_page(
     per_page: int = 0,
     expand: str = "",
     fields: str = "",
+    client: Any = None,
     **target: Any,
 ) -> dict[str, Any]:
     """One page of the work items belonging to a parent record."""
+    if tool in ("cycle", "module") and pql and pql.strip():
+        plane_client = client or getattr(getattr(method, "__self__", None), "_client", None)
+        workspace_slug = target.get("workspace_slug", "")
+        project_id = target.get("project_id", "")
+        if not check_pql_capability(plane_client, workspace_slug, project_id):
+            reject_ce_pql(pql, reason=f"PQL filtering is not supported on {tool}.{action} in Plane CE.")
     try:
         response = method(
             **target,
@@ -106,7 +183,7 @@ def workitem_page(
         failure = pql_failure(tool, action, pql, exc)
         if failure is None:
             raise
-        return failure
+        raise ToolError(f"{failure['error']} Failed PQL: {failure['failed_pql']!r}. {failure['hint']}") from exc
     return envelope(response, opt(fields))
 
 

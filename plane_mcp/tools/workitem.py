@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal, get_args
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from fastmcp.utilities.logging import get_logger
 from plane.errors.errors import HttpError
 from plane.models.enums import PriorityEnum
@@ -34,6 +35,7 @@ from plane_mcp.toolkit import (
     Action,
     build_annotations,
     build_description,
+    check_pql_capability,
     coerce_list,
     envelope,
     ids_of,
@@ -41,6 +43,7 @@ from plane_mcp.toolkit import (
     one_of,
     opt,
     pql_failure,
+    reject_ce_pql,
     rich_text,
 )
 
@@ -281,6 +284,12 @@ def register(mcp: FastMCP) -> None:
         if action in ("list", "list_archived"):
             if action == "list_archived" and not project_id:
                 return missing(action, "project_id")
+            if pql and pql.strip():
+                if not check_pql_capability(client, workspace_slug, project_id):
+                    reject_ce_pql(
+                        pql,
+                        reason="PQL filtering is not supported on this Plane installation.",
+                    )
             params = WorkItemQueryParams(
                 pql=opt(pql),
                 order_by=opt(order_by),
@@ -305,7 +314,9 @@ def register(mcp: FastMCP) -> None:
             except HttpError as exc:
                 failure = pql_failure("workitem", action, pql, exc)
                 if failure:
-                    return failure
+                    raise ToolError(
+                        f"{failure['error']} Failed PQL: {failure['failed_pql']!r}. {failure['hint']}"
+                    ) from exc
                 raise
             return envelope(response, opt(fields))
 
@@ -321,7 +332,9 @@ def register(mcp: FastMCP) -> None:
             except HttpError as exc:
                 failure = pql_failure("workitem", action, scoped, exc)
                 if failure:
-                    return failure
+                    raise ToolError(
+                        f"{failure['error']} Failed PQL: {failure['failed_pql']!r}. {failure['hint']}"
+                    ) from exc
                 raise
             return response.model_dump()
 
