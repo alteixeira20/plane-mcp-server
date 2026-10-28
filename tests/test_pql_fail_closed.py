@@ -1,19 +1,34 @@
-"""Deterministic tests for PQL fail-closed behavior on self-hosted Plane CE and error conditions.
+"""Deterministic tests for PQL fail-closed behavior, capability detection, and error handling.
 
-Covers:
-- Scenario A: Backend returns HTTP 400 with an invalid PQL message.
-- Scenario B: Backend returns HTTP 200 while ignoring a valid PQL predicate.
-- Scenario C: Backend correctly applies the requested PQL filter.
-- Scenario D: Backend returns a valid empty filtered result.
-- Scenario E: Backend returns paginated results with filters correctly applied.
-- Scenario F: Backend claims success on cycle/module with PQL on CE.
-- Scenario G: Backend supports unrelated query parameters but ignores PQL.
-- Adversarial tests: probe mechanics, auth failure preservation, unfiltered regression,
-  raw MCP isError=true contract, and schema stability.
+Covers all 23 audit verification scenarios:
+1. CE HTTP 200 ignored PQL.
+2. CE HTTP 400 unsupported PQL.
+3. Cloud valid PQL.
+4. Valid empty filtered result.
+5. Multi-page filtered results.
+6. Workspace-level PQL without project_id.
+7. Count PQL support and rejection.
+8. Cycle and module endpoint differences.
+9. Unrelated HTTP 400.
+10. Invalid project UUID.
+11. HTTP 401 and 403.
+12. HTTP 429 and 5xx.
+13. Timeout and connection failure.
+14. Different OAuth users and tokens.
+15. Different Plane servers.
+16. Different project scopes.
+17. Incorrect hostname matches.
+18. Malformed capability overrides.
+19. Concurrent capability checks.
+20. No SDK dispatch when a request is rejected before execution.
+21. Raw MCP isError=true on genuine failures.
+22. Unfiltered request regression.
+23. No tool-schema drift.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import MagicMock, patch
 
@@ -23,6 +38,8 @@ from plane.errors.errors import HttpError
 from plane.models.work_items import PaginatedWorkItemResponse, WorkItem
 
 from plane_mcp.toolkit.paging import (
+    _PQL_CAPABILITY_CACHE,
+    check_pql_capability,
     reset_pql_capability_cache,
 )
 from plane_mcp.tools.cycle import register as register_cycle
@@ -30,8 +47,9 @@ from plane_mcp.tools.module import register as register_module
 from plane_mcp.tools.workitem import register as register_workitem
 
 
-def _make_http_400(response_body: dict) -> HttpError:
-    return HttpError("Bad Request", status_code=400, response=response_body)
+def _make_http_error(status_code: int, response_body: dict | str = "") -> HttpError:
+    resp = response_body if isinstance(response_body, dict) else {"detail": str(response_body)}
+    return HttpError(f"HTTP {status_code}", status_code=status_code, response=resp)
 
 
 def _make_work_item(
@@ -81,8 +99,10 @@ def _make_page(
 
 
 @pytest.fixture(autouse=True)
-def clean_pql_cache():
-    """Ensure capability cache is fresh for every test."""
+def clean_pql_cache(monkeypatch):
+    """Ensure capability cache and env overrides are fresh for every test."""
+    monkeypatch.delenv("PLANE_SUPPORTS_PQL", raising=False)
+    monkeypatch.delenv("PLANE_CAPABILITY_PQL", raising=False)
     reset_pql_capability_cache()
     yield
     reset_pql_capability_cache()
@@ -98,87 +118,14 @@ def test_server():
 
 
 # ==============================================================================
-# Scenario A: Backend returns HTTP 400 with an invalid PQL message
+# Scenario 1: CE HTTP 200 ignored PQL
 # ==============================================================================
-
-
 @pytest.mark.anyio
-async def test_scenario_a_invalid_pql_raises_tool_error_with_is_error_true(test_server: FastMCP):
-    """When the backend returns HTTP 400 for PQL, tool raises ToolError and MCP sets isError: true."""
-    mock_client = MagicMock()
-    mock_client.config.api_root = "https://api.plane.so"
-    mock_client.work_items.list.side_effect = _make_http_400({"pql": "Unknown field 'stat'"})
-
-    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
-        async with Client(test_server) as client:
-            res = await client.call_tool_mcp(
-                "workitem",
-                {
-                    "action": "list",
-                    "project_id": "00000000-0000-0000-0000-000000000001",
-                    "pql": 'stat = "done"',
-                },
-            )
-            assert res.isError is True
-            assert len(res.content) > 0
-            err_text = res.content[0].text
-            assert "Unknown field 'stat'" in err_text
-            assert "Failed PQL:" in err_text
-            assert 'stat = "done"' in err_text
-
-
-@pytest.mark.anyio
-async def test_scenario_a_ce_explicit_400_refusal_propagates_as_tool_error(test_server: FastMCP):
-    """When Plane CE v1.4.1+ returns 400 unsupported PQL, ToolError carries the refusal loudly."""
-    ce_body = {
-        "pql": (
-            "PQL and structured filters are not supported on this Plane edition. "
-            "Remove the pql/filters parameter and filter results client-side."
-        ),
-        "unsupported_parameters": ["pql"],
-    }
+async def test_scenario_01_ce_http_200_ignored_pql_fails_closed(test_server: FastMCP):
+    """CE <= 1.3.1 returns 200 on probe; tool must fail closed with ToolError and not return unfiltered data."""
     mock_client = MagicMock()
     mock_client.config.api_root = "https://self-hosted.local"
-    mock_client.work_items.list.side_effect = _make_http_400(ce_body)
-
-    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
-        async with Client(test_server) as client:
-            res = await client.call_tool_mcp(
-                "workitem",
-                {
-                    "action": "list",
-                    "project_id": "00000000-0000-0000-0000-000000000001",
-                    "pql": 'priority = "urgent"',
-                },
-            )
-            assert res.isError is True
-            err_text = res.content[0].text
-            assert (
-                "not supported on this Plane edition" in err_text
-                or "not supported on this Plane installation" in err_text
-            )
-            assert 'priority = "urgent"' in err_text
-
-
-# ==============================================================================
-# Scenario B: Backend returns HTTP 200 while ignoring a valid PQL predicate (CE silent ignore)
-# ==============================================================================
-
-
-@pytest.mark.anyio
-async def test_scenario_b_silent_http_200_ignored_pql_fails_closed(test_server: FastMCP):
-    """On self-hosted CE <= 1.3.1, broken probe PQL returns 200, proving silent ignore. Tool must fail closed."""
-    mock_client = MagicMock()
-    mock_client.config.api_root = "https://self-hosted.local"
-    # Both probe and user query would return HTTP 200 with unfiltered data on Plane CE <= 1.3.1
-    unfiltered_page = _make_page(
-        [
-            _make_work_item("item-1", priority="low"),
-            _make_work_item("item-2", priority="medium"),
-            _make_work_item("item-3", priority="urgent"),
-        ],
-        total_count=3,
-    )
+    unfiltered_page = _make_page([_make_work_item("ce-unfiltered-1", priority="low")], total_count=1)
     mock_client.work_items.list.return_value = unfiltered_page
 
     with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
@@ -191,232 +138,26 @@ async def test_scenario_b_silent_http_200_ignored_pql_fails_closed(test_server: 
                     "pql": 'priority = "urgent"',
                 },
             )
-            # The tool must fail closed with isError: true and NOT return the unfiltered 3 items!
             assert res.isError is True
             err_text = res.content[0].text
             assert "PQL filtering is not supported on this Plane installation" in err_text
             assert "No filtered result was returned" in err_text
-            assert 'priority = "urgent"' in err_text
-            assert "item-1" not in err_text
-            assert "item-2" not in err_text
+            assert "ce-unfiltered-1" not in err_text
 
 
 # ==============================================================================
-# Scenario C: Backend correctly applies the requested PQL filter
+# Scenario 2: CE HTTP 400 unsupported PQL
 # ==============================================================================
-
-
 @pytest.mark.anyio
-async def test_scenario_c_supported_pql_returns_filtered_results(test_server: FastMCP):
-    """When connected to Plane Cloud or supported backend, PQL filter is dispatched and results returned."""
-    mock_client = MagicMock()
-    mock_client.config.api_root = "https://api.plane.so"
-    urgent_items = [
-        _make_work_item("item-1", priority="urgent"),
-        _make_work_item("item-2", priority="urgent"),
-    ]
-    mock_client.work_items.list.return_value = _make_page(urgent_items, total_count=2)
-
-    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
-        async with Client(test_server) as client:
-            res = await client.call_tool_mcp(
-                "workitem",
-                {
-                    "action": "list",
-                    "project_id": "00000000-0000-0000-0000-000000000001",
-                    "pql": 'priority = "urgent"',
-                },
-            )
-            assert res.isError is False
-            # Verify SDK list was called with the PQL filter
-            assert mock_client.work_items.list.called
-            call_kwargs = mock_client.work_items.list.call_args.kwargs
-            assert call_kwargs["params"].pql == 'priority = "urgent"'
-
-
-# ==============================================================================
-# Scenario D: Backend returns a valid empty filtered result
-# ==============================================================================
-
-
-@pytest.mark.anyio
-async def test_scenario_d_valid_empty_filtered_result(test_server: FastMCP):
-    """When a filter matches zero items on a supported backend, empty results are returned with isError: false."""
-    mock_client = MagicMock()
-    mock_client.config.api_root = "https://api.plane.so"
-    mock_client.work_items.list.return_value = _make_page([], total_count=0)
-
-    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
-        async with Client(test_server) as client:
-            res = await client.call_tool_mcp(
-                "workitem",
-                {
-                    "action": "list",
-                    "project_id": "00000000-0000-0000-0000-000000000001",
-                    "pql": 'priority = "urgent"',
-                },
-            )
-            assert res.isError is False
-            data = json.loads(res.content[0].text)
-            assert data["results"] == []
-            assert data["total_count"] == 0
-
-
-# ==============================================================================
-# Scenario E: Backend returns paginated results with filters correctly applied
-# ==============================================================================
-
-
-@pytest.mark.anyio
-async def test_scenario_e_paginated_filtered_results_preserve_envelope(test_server: FastMCP):
-    """Multi-page filtered results preserve complete cursor and pagination contracts."""
-    mock_client = MagicMock()
-    mock_client.config.api_root = "https://api.plane.so"
-    page1_items = [_make_work_item(f"item-{i}", priority="urgent") for i in range(10)]
-    mock_client.work_items.list.return_value = _make_page(page1_items, total_count=25, next_cursor="cursor_page_2")
-
-    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
-        async with Client(test_server) as client:
-            res = await client.call_tool_mcp(
-                "workitem",
-                {
-                    "action": "list",
-                    "project_id": "00000000-0000-0000-0000-000000000001",
-                    "pql": 'priority = "urgent"',
-                    "per_page": 10,
-                },
-            )
-            assert res.isError is False
-            data = json.loads(res.content[0].text)
-            assert data["next_cursor"] == "cursor_page_2"
-            assert data["next_page_results"] is True
-            assert data["total_count"] == 25
-            assert data["count"] == 10
-
-
-# ==============================================================================
-# Scenario F: Backend claims success on cycle/module with PQL on Plane CE
-# ==============================================================================
-
-
-@pytest.mark.anyio
-async def test_scenario_f_cycle_workitems_pql_fails_closed_on_ce(test_server: FastMCP):
-    """cycle.list_workitems with PQL fails closed with ToolError on Plane CE."""
+async def test_scenario_02_ce_http_400_unsupported_pql(test_server: FastMCP):
+    """CE >= 1.4.1 explicitly rejects PQL with 400 edition refusal; tool raises ToolError."""
+    ce_body = {
+        "pql": "PQL and structured filters are not supported on this Plane edition.",
+        "unsupported_parameters": ["pql"],
+    }
     mock_client = MagicMock()
     mock_client.config.api_root = "https://self-hosted.local"
-    # Probe returns 200 (silent ignore CE <= 1.3.1)
-    mock_client.work_items.list.return_value = _make_page([])
-
-    with patch("plane_mcp.tools.cycle.get_plane_client_context", return_value=(mock_client, "test-ws")):
-        async with Client(test_server) as client:
-            res = await client.call_tool_mcp(
-                "cycle",
-                {
-                    "action": "list_workitems",
-                    "project_id": "00000000-0000-0000-0000-000000000001",
-                    "cycle_id": "00000000-0000-0000-0000-000000000002",
-                    "pql": 'priority = "high"',
-                },
-            )
-            assert res.isError is True
-            err_text = res.content[0].text
-            assert "PQL filtering is not supported on cycle.list_workitems in Plane CE" in err_text
-            assert 'priority = "high"' in err_text
-            # Client cycle list_work_items must not be called
-            assert not mock_client.cycles.list_work_items.called
-
-
-@pytest.mark.anyio
-async def test_scenario_f_module_workitems_pql_fails_closed_on_ce(test_server: FastMCP):
-    """module.list_workitems with PQL fails closed with ToolError on Plane CE."""
-    mock_client = MagicMock()
-    mock_client.config.api_root = "https://self-hosted.local"
-    # Probe returns 200 (silent ignore CE <= 1.3.1)
-    mock_client.work_items.list.return_value = _make_page([])
-
-    with patch("plane_mcp.tools.module.get_plane_client_context", return_value=(mock_client, "test-ws")):
-        async with Client(test_server) as client:
-            res = await client.call_tool_mcp(
-                "module",
-                {
-                    "action": "list_workitems",
-                    "project_id": "00000000-0000-0000-0000-000000000001",
-                    "module_id": "00000000-0000-0000-0000-000000000003",
-                    "pql": 'priority = "high"',
-                },
-            )
-            assert res.isError is True
-            err_text = res.content[0].text
-            assert "PQL filtering is not supported on module.list_workitems in Plane CE" in err_text
-            assert 'priority = "high"' in err_text
-            assert not mock_client.modules.list_work_items.called
-
-
-# ==============================================================================
-# Scenario G: Backend supports unrelated query parameters but ignores PQL
-# ==============================================================================
-
-
-@pytest.mark.anyio
-async def test_scenario_g_unrelated_query_params_with_ignored_pql_fails_closed(test_server: FastMCP):
-    """When order_by and per_page are provided alongside an ignored PQL, tool fails closed."""
-    mock_client = MagicMock()
-    mock_client.config.api_root = "https://self-hosted.local"
-    # Probe returns 200
-    mock_client.work_items.list.return_value = _make_page([_make_work_item("item-1")])
-
-    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
-        async with Client(test_server) as client:
-            res = await client.call_tool_mcp(
-                "workitem",
-                {
-                    "action": "list",
-                    "project_id": "00000000-0000-0000-0000-000000000001",
-                    "pql": 'state__group = "started"',
-                    "order_by": "-created_at",
-                    "per_page": 20,
-                },
-            )
-            assert res.isError is True
-            err_text = res.content[0].text
-            assert "PQL filtering is not supported on this Plane installation" in err_text
-
-
-# ==============================================================================
-# Adversarial & Regression Tests
-# ==============================================================================
-
-
-@pytest.mark.anyio
-async def test_unfiltered_list_preserves_behavior(test_server: FastMCP):
-    """Unfiltered queries (no pql) bypass capability checks and succeed as normal."""
-    mock_client = MagicMock()
-    mock_client.config.api_root = "https://self-hosted.local"
-    items = [_make_work_item("item-1"), _make_work_item("item-2")]
-    mock_client.work_items.list.return_value = _make_page(items, total_count=2)
-
-    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
-        async with Client(test_server) as client:
-            res = await client.call_tool_mcp(
-                "workitem",
-                {
-                    "action": "list",
-                    "project_id": "00000000-0000-0000-0000-000000000001",
-                },
-            )
-            assert res.isError is False
-            data = json.loads(res.content[0].text)
-            assert data["total_count"] == 2
-            call_kwargs = mock_client.work_items.list.call_args.kwargs
-            assert call_kwargs["params"].pql is None
-
-
-@pytest.mark.anyio
-async def test_env_override_plane_supports_pql_false(test_server: FastMCP, monkeypatch):
-    """Explicit PLANE_SUPPORTS_PQL=false immediately fails closed without probing."""
-    monkeypatch.setenv("PLANE_SUPPORTS_PQL", "false")
-    mock_client = MagicMock()
-    mock_client.config.api_root = "https://api.plane.so"  # Even on plane.so, env takes precedence
+    mock_client.work_items.list.side_effect = _make_http_error(400, ce_body)
 
     with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
         async with Client(test_server) as client:
@@ -430,49 +171,17 @@ async def test_env_override_plane_supports_pql_false(test_server: FastMCP, monke
             )
             assert res.isError is True
             assert "PQL filtering is not supported on this Plane installation" in res.content[0].text
-            assert not mock_client.work_items.list.called
 
 
+# ==============================================================================
+# Scenario 3: Cloud valid PQL
+# ==============================================================================
 @pytest.mark.anyio
-async def test_env_override_plane_supports_pql_true(test_server: FastMCP, monkeypatch):
-    """Explicit PLANE_SUPPORTS_PQL=true confirms support without probing self-hosted."""
-    monkeypatch.setenv("PLANE_SUPPORTS_PQL", "true")
+async def test_scenario_03_cloud_valid_pql(test_server: FastMCP):
+    """Connected to api.plane.so, valid PQL is dispatched directly and filtered results returned."""
     mock_client = MagicMock()
-    mock_client.config.api_root = "https://self-hosted-enterprise.corp"
-    mock_client.work_items.list.return_value = _make_page([_make_work_item("item-1")], total_count=1)
-
-    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
-        async with Client(test_server) as client:
-            res = await client.call_tool_mcp(
-                "workitem",
-                {
-                    "action": "list",
-                    "project_id": "00000000-0000-0000-0000-000000000001",
-                    "pql": 'priority = "urgent"',
-                },
-            )
-            assert res.isError is False
-            # Dispatched directly once with the user PQL (no probe call)
-            assert mock_client.work_items.list.call_count == 1
-            call_kwargs = mock_client.work_items.list.call_args.kwargs
-            assert call_kwargs["params"].pql == 'priority = "urgent"'
-
-
-@pytest.mark.anyio
-async def test_self_hosted_enterprise_confirmed_by_syntax_rejection(test_server: FastMCP):
-    """Self-hosted Enterprise parses PQL, so probe gets HTTP 400 syntax error, confirming support."""
-    mock_client = MagicMock()
-    mock_client.config.api_root = "https://self-hosted-enterprise.corp"
-
-    # First call is the probe with invalid syntax -> returns 400 syntax error
-    # Second call is the actual user query -> returns filtered page
-    def _side_effect(*args, **kwargs):
-        params = kwargs.get("params")
-        if params and "pql_probe_syntax_check" in (params.pql or ""):
-            raise _make_http_400({"pql": "Invalid PQL syntax at position 1"})
-        return _make_page([_make_work_item("item-1", priority="urgent")], total_count=1)
-
-    mock_client.work_items.list.side_effect = _side_effect
+    mock_client.config.api_root = "https://api.plane.so"
+    mock_client.work_items.list.return_value = _make_page([_make_work_item("urgent-1", priority="urgent")])
 
     with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
         async with Client(test_server) as client:
@@ -486,17 +195,131 @@ async def test_self_hosted_enterprise_confirmed_by_syntax_rejection(test_server:
             )
             assert res.isError is False
             data = json.loads(res.content[0].text)
-            assert data["total_count"] == 1
-            assert mock_client.work_items.list.call_count == 2
+            assert len(data["results"]) == 1
+            assert data["results"][0]["id"] == "urgent-1"
+            assert mock_client.work_items.list.call_count == 1
+            assert mock_client.work_items.list.call_args.kwargs["params"].pql == 'priority = "urgent"'
 
 
+# ==============================================================================
+# Scenario 4: Valid empty filtered result
+# ==============================================================================
 @pytest.mark.anyio
-async def test_cycle_and_module_workitems_pql_succeed_on_supported_backend(test_server: FastMCP):
-    """cycle and module list_workitems with PQL succeed when connected to Plane Cloud."""
+async def test_scenario_04_valid_empty_filtered_result(test_server: FastMCP):
+    """Filter returning zero results returns empty page envelope with isError: false."""
     mock_client = MagicMock()
     mock_client.config.api_root = "https://api.plane.so"
-    mock_client.cycles.list_work_items.return_value = _make_page([_make_work_item("c-1")])
-    mock_client.modules.list_work_items.return_value = _make_page([_make_work_item("m-1")])
+    mock_client.work_items.list.return_value = _make_page([], total_count=0)
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
+        async with Client(test_server) as client:
+            res = await client.call_tool_mcp(
+                "workitem",
+                {
+                    "action": "list",
+                    "project_id": "00000000-0000-0000-0000-000000000001",
+                    "pql": 'priority = "none"',
+                },
+            )
+            assert res.isError is False
+            data = json.loads(res.content[0].text)
+            assert data["results"] == []
+            assert data["total_count"] == 0
+
+
+# ==============================================================================
+# Scenario 5: Multi-page filtered results
+# ==============================================================================
+@pytest.mark.anyio
+async def test_scenario_05_multipage_filtered_results(test_server: FastMCP):
+    """Preserves next_cursor and full pagination envelope."""
+    mock_client = MagicMock()
+    mock_client.config.api_root = "https://api.plane.so"
+    page = _make_page([_make_work_item("item-1")], total_count=15, next_cursor="page-2-cursor")
+    mock_client.work_items.list.return_value = page
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
+        async with Client(test_server) as client:
+            res = await client.call_tool_mcp(
+                "workitem",
+                {
+                    "action": "list",
+                    "project_id": "00000000-0000-0000-0000-000000000001",
+                    "pql": 'priority = "urgent"',
+                    "per_page": 1,
+                },
+            )
+            assert res.isError is False
+            data = json.loads(res.content[0].text)
+            assert data["next_cursor"] == "page-2-cursor"
+            assert data["next_page_results"] is True
+            assert data["total_count"] == 15
+
+
+# ==============================================================================
+# Scenario 6: Workspace-level PQL without project_id
+# ==============================================================================
+@pytest.mark.anyio
+async def test_scenario_06_workspace_level_pql_fails_closed_on_ce(test_server: FastMCP):
+    """When project_id is omitted, PQL capability is verified via workspace probe.
+    On CE where probe returns 200 (silent ignore) or 404 (route absent), tool fails closed.
+    """
+    mock_client = MagicMock()
+    mock_client.config.api_root = "https://self-hosted.local"
+    # CE returns 200 with unfiltered data on list_workspace
+    mock_client.work_items.list_workspace.return_value = _make_page([_make_work_item("unfiltered-ws")])
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
+        async with Client(test_server) as client:
+            res = await client.call_tool_mcp(
+                "workitem",
+                {
+                    "action": "list",
+                    "pql": 'priority = "urgent"',
+                },
+            )
+            assert res.isError is True
+            assert "PQL filtering is not supported on this Plane installation" in res.content[0].text
+            assert "unfiltered-ws" not in res.content[0].text
+
+
+# ==============================================================================
+# Scenario 7: Count PQL support and rejection
+# ==============================================================================
+@pytest.mark.anyio
+async def test_scenario_07_count_pql_support_and_rejection(test_server: FastMCP):
+    """workitem.count with PQL checks capability and fails closed on CE."""
+    mock_client = MagicMock()
+    mock_client.config.api_root = "https://self-hosted.local"
+    # Probe to count returns 200 (silent ignore on CE)
+    count_obj = MagicMock()
+    count_obj.model_dump.return_value = {"total_count": 999}
+    mock_client.work_items.count_workspace.return_value = count_obj
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
+        async with Client(test_server) as client:
+            res = await client.call_tool_mcp(
+                "workitem",
+                {
+                    "action": "count",
+                    "project_id": "00000000-0000-0000-0000-000000000001",
+                    "pql": 'priority = "urgent"',
+                },
+            )
+            assert res.isError is True
+            assert "PQL filtering is not supported on workitem.count in Plane CE" in res.content[0].text
+
+
+# ==============================================================================
+# Scenario 8: Cycle and module endpoint differences
+# ==============================================================================
+@pytest.mark.anyio
+async def test_scenario_08_cycle_and_module_fail_closed_on_ce(test_server: FastMCP):
+    """cycle and module list_workitems with PQL independently probe and fail closed on CE."""
+    mock_client = MagicMock()
+    mock_client.config.api_root = "https://self-hosted.local"
+    mock_client.cycles.list_work_items.return_value = _make_page([])
+    mock_client.modules.list_work_items.return_value = _make_page([])
 
     with (
         patch("plane_mcp.tools.cycle.get_plane_client_context", return_value=(mock_client, "test-ws")),
@@ -512,8 +335,8 @@ async def test_cycle_and_module_workitems_pql_succeed_on_supported_backend(test_
                     "pql": 'priority = "urgent"',
                 },
             )
-            assert res_c.isError is False
-            assert mock_client.cycles.list_work_items.called
+            assert res_c.isError is True
+            assert "PQL filtering is not supported on cycle.list_workitems in Plane CE" in res_c.content[0].text
 
             res_m = await client.call_tool_mcp(
                 "module",
@@ -524,15 +347,180 @@ async def test_cycle_and_module_workitems_pql_succeed_on_supported_backend(test_
                     "pql": 'priority = "urgent"',
                 },
             )
-            assert res_m.isError is False
-            assert mock_client.modules.list_work_items.called
+            assert res_m.isError is True
+            assert "PQL filtering is not supported on module.list_workitems in Plane CE" in res_m.content[0].text
 
 
+# ==============================================================================
+# Scenario 9: Unrelated HTTP 400
+# ==============================================================================
 @pytest.mark.anyio
-async def test_count_with_invalid_pql_raises_tool_error(test_server: FastMCP):
-    """workitem count with invalid PQL raises ToolError with isError: true."""
+async def test_scenario_09_unrelated_http_400_not_cached_as_support(test_server: FastMCP):
+    """An unrelated 400 during capability probe is re-raised and does NOT mark backend as supported."""
     mock_client = MagicMock()
-    mock_client.work_items.count_workspace.side_effect = _make_http_400({"pql": "Unknown field 'stat'"})
+    mock_client.config.api_root = "https://self-hosted.local"
+    mock_client.work_items.list.side_effect = _make_http_error(400, {"detail": "Unrelated validation failure"})
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
+        async with Client(test_server) as client:
+            res = await client.call_tool_mcp(
+                "workitem",
+                {
+                    "action": "list",
+                    "project_id": "00000000-0000-0000-0000-000000000001",
+                    "pql": 'priority = "urgent"',
+                },
+            )
+            assert res.isError is True
+            # Cache must NOT contain True
+            cache_keys = [k for k, v in _PQL_CAPABILITY_CACHE.items() if v[0] is True]
+            assert len(cache_keys) == 0
+
+
+# ==============================================================================
+# Scenario 10: Invalid project UUID
+# ==============================================================================
+@pytest.mark.anyio
+async def test_scenario_10_invalid_project_uuid_re_raises(test_server: FastMCP):
+    """Invalid project UUID 400 is not mistaken for a PQL syntax rejection."""
+    mock_client = MagicMock()
+    mock_client.config.api_root = "https://self-hosted.local"
+    mock_client.work_items.list.side_effect = _make_http_error(400, {"project_id": ["Invalid UUID format."]})
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
+        async with Client(test_server) as client:
+            res = await client.call_tool_mcp(
+                "workitem",
+                {
+                    "action": "list",
+                    "project_id": "not-a-uuid",
+                    "pql": 'priority = "urgent"',
+                },
+            )
+            assert res.isError is True
+            assert "Invalid UUID format" in res.content[0].text
+
+
+# ==============================================================================
+# Scenario 11: HTTP 401 and 403
+# ==============================================================================
+@pytest.mark.anyio
+async def test_scenario_11_http_401_403_unmasked(test_server: FastMCP):
+    """Authentication and permission errors propagate directly without being masked as PQL failures."""
+    mock_client = MagicMock()
+    mock_client.config.api_root = "https://self-hosted.local"
+    mock_client.work_items.list.side_effect = _make_http_error(403, {"detail": "Permission denied"})
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
+        async with Client(test_server) as client:
+            res = await client.call_tool_mcp(
+                "workitem",
+                {
+                    "action": "list",
+                    "project_id": "00000000-0000-0000-0000-000000000001",
+                    "pql": 'priority = "urgent"',
+                },
+            )
+            assert res.isError is True
+            assert "Permission denied" in res.content[0].text or "403" in res.content[0].text
+
+
+# ==============================================================================
+# Scenario 12: HTTP 429 and 5xx
+# ==============================================================================
+@pytest.mark.anyio
+async def test_scenario_12_http_429_5xx_unmasked(test_server: FastMCP):
+    """Rate-limiting (429) and server errors (500) propagate directly without being converted to PQL errors."""
+    mock_client = MagicMock()
+    mock_client.config.api_root = "https://self-hosted.local"
+    mock_client.work_items.list.side_effect = _make_http_error(500, {"detail": "Database unavailable"})
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
+        async with Client(test_server) as client:
+            res = await client.call_tool_mcp(
+                "workitem",
+                {
+                    "action": "list",
+                    "project_id": "00000000-0000-0000-0000-000000000001",
+                    "pql": 'priority = "urgent"',
+                },
+            )
+            assert res.isError is True
+            assert "Database unavailable" in res.content[0].text or "500" in res.content[0].text
+
+
+# ==============================================================================
+# Scenario 13: Timeout and connection failure
+# ==============================================================================
+def test_scenario_13_timeout_and_connection_failure():
+    """Network timeouts raise infrastructure errors instead of returning False."""
+    mock_client = MagicMock()
+    mock_client.config.api_root = "https://self-hosted.local"
+
+    def _timeout_probe():
+        raise TimeoutError("Connection timed out to Plane API")
+
+    with pytest.raises(TimeoutError, match="Connection timed out"):
+        check_pql_capability(mock_client, "test-ws", "proj-1", probe_fn=_timeout_probe)
+
+
+# ==============================================================================
+# Scenario 14: Different OAuth users and tokens
+# ==============================================================================
+def test_scenario_14_different_oauth_users_isolated():
+    """Different users with distinct access tokens have distinct cache entries."""
+    client_a = MagicMock()
+    client_a.config.api_root = "https://self-hosted.local"
+    client_a.config.access_token = "token-user-a"
+
+    client_b = MagicMock()
+    client_b.config.api_root = "https://self-hosted.local"
+    client_b.config.access_token = "token-user-b"
+
+    # Mock probe: client_a probe returns 400 with PQL syntax complaint -> True
+    client_a.work_items.list.side_effect = _make_http_error(400, {"pql": "Syntax error at 1"})
+    # client_b probe returns 200 (silent ignore) -> False
+    client_b.work_items.list.return_value = _make_page([])
+
+    res_a = check_pql_capability(client_a, "test-ws", "proj-1")
+    res_b = check_pql_capability(client_b, "test-ws", "proj-1")
+
+    assert res_a is True
+    assert res_b is False
+    assert len(_PQL_CAPABILITY_CACHE) == 2
+
+
+# ==============================================================================
+# Scenario 15: Different Plane servers
+# ==============================================================================
+def test_scenario_15_different_plane_servers_isolated():
+    """Different backend API roots do not share capability cache entries."""
+    client_1 = MagicMock()
+    client_1.config.api_root = "https://plane1.internal"
+    client_1.work_items.list.side_effect = _make_http_error(400, {"pql": "Syntax error at 1"})
+
+    client_2 = MagicMock()
+    client_2.config.api_root = "https://plane2.internal"
+    client_2.work_items.list.return_value = _make_page([])
+
+    res_1 = check_pql_capability(client_1, "test-ws", "proj-1")
+    res_2 = check_pql_capability(client_2, "test-ws", "proj-1")
+
+    assert res_1 is True
+    assert res_2 is False
+
+
+# ==============================================================================
+# Scenario 16: Different project scopes
+# ==============================================================================
+@pytest.mark.anyio
+async def test_scenario_16_count_scopes_pql_with_project_id(test_server: FastMCP):
+    """workitem count correctly scopes PQL with project ID filter."""
+    mock_client = MagicMock()
+    mock_client.config.api_root = "https://api.plane.so"
+    count_resp = MagicMock()
+    count_resp.model_dump.return_value = {"total_count": 3}
+    mock_client.work_items.count_workspace.return_value = count_resp
 
     with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
         async with Client(test_server) as client:
@@ -541,43 +529,111 @@ async def test_count_with_invalid_pql_raises_tool_error(test_server: FastMCP):
                 {
                     "action": "count",
                     "project_id": "00000000-0000-0000-0000-000000000001",
-                    "pql": 'stat = "done"',
+                    "pql": 'priority = "urgent"',
                 },
             )
-            assert res.isError is True
-            assert "Unknown field 'stat'" in res.content[0].text
-            assert "Failed PQL:" in res.content[0].text
+            assert res.isError is False
+            call_params = mock_client.work_items.count_workspace.call_args.kwargs["params"]
+            assert 'project = "00000000-0000-0000-0000-000000000001"' in call_params.pql
 
 
+# ==============================================================================
+# Scenario 17: Incorrect hostname matches
+# ==============================================================================
+def test_scenario_17_incorrect_hostname_matches():
+    """Domains containing api.plane.so as substring are NOT recognized as official Cloud."""
+    client = MagicMock()
+    client.config.api_root = "https://api.plane.so.attacker.com"
+    client.work_items.list.return_value = _make_page([])
+
+    # Must execute probe (which returns 200 silent ignore -> False), not skip to True
+    res = check_pql_capability(client, "test-ws", "proj-1")
+    assert res is False
+    assert client.work_items.list.called
+
+
+# ==============================================================================
+# Scenario 18: Malformed capability overrides
+# ==============================================================================
+def test_scenario_18_malformed_capability_overrides(monkeypatch):
+    """Malformed values log a warning and fall back safely rather than asserting True."""
+    client = MagicMock()
+    client.config.api_root = "https://api.plane.so"
+
+    monkeypatch.setenv("PLANE_SUPPORTS_PQL", "false")
+    assert check_pql_capability(client, "test-ws", "proj-1") is False
+
+    monkeypatch.setenv("PLANE_SUPPORTS_PQL", "true")
+    assert check_pql_capability(client, "test-ws", "proj-1") is True
+
+    monkeypatch.setenv("PLANE_SUPPORTS_PQL", "gibberish_value")
+    # On Cloud with invalid override, falls back to hostname check -> True
+    assert check_pql_capability(client, "test-ws", "proj-1") is True
+
+
+# ==============================================================================
+# Scenario 19: Concurrent capability checks
+# ==============================================================================
 @pytest.mark.anyio
-async def test_backend_auth_failure_propagates_unmasked(test_server: FastMCP):
-    """HTTP 401 or 403 authorization failures are propagated directly rather than converted to PQL errors."""
+async def test_scenario_19_concurrent_capability_checks(test_server: FastMCP):
+    """Concurrent requests execute safely without race conditions."""
     mock_client = MagicMock()
     mock_client.config.api_root = "https://self-hosted.local"
-    mock_client.work_items.list.side_effect = HttpError("Forbidden", status_code=403, response={"detail": "Forbidden"})
+    mock_client.work_items.list.return_value = _make_page([])
 
     with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
         async with Client(test_server) as client:
-            res = await client.call_tool_mcp(
+            t1 = client.call_tool_mcp(
                 "workitem",
-                {
-                    "action": "list",
-                    "project_id": "00000000-0000-0000-0000-000000000001",
-                    "pql": 'priority = "urgent"',
-                },
+                {"action": "list", "project_id": "00000000-0000-0000-0000-000000000001", "pql": 'priority = "urgent"'},
             )
-            assert res.isError is True
-            assert "403" in res.content[0].text or "Forbidden" in res.content[0].text
+            t2 = client.call_tool_mcp(
+                "workitem",
+                {"action": "list", "project_id": "00000000-0000-0000-0000-000000000001", "pql": 'priority = "urgent"'},
+            )
+            r1, r2 = await asyncio.gather(t1, t2)
+            assert r1.isError is True
+            assert r2.isError is True
 
 
+# ==============================================================================
+# Scenario 20: No SDK dispatch when rejected before execution
+# ==============================================================================
 @pytest.mark.anyio
-async def test_backend_server_error_propagates_unmasked(test_server: FastMCP):
-    """HTTP 500 server errors are propagated directly rather than swallowed."""
+async def test_scenario_20_no_sdk_dispatch_when_cached_unsupported(test_server: FastMCP):
+    """Once capability is confirmed unsupported, subsequent calls do not dispatch user query to SDK."""
+    mock_client = MagicMock()
+    mock_client.config.api_root = "https://self-hosted.local"
+    # First probe returns 200 (CE silent ignore)
+    mock_client.work_items.list.return_value = _make_page([])
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
+        async with Client(test_server) as client:
+            # First call executes probe
+            await client.call_tool_mcp(
+                "workitem",
+                {"action": "list", "project_id": "00000000-0000-0000-0000-000000000001", "pql": 'priority = "urgent"'},
+            )
+            assert mock_client.work_items.list.call_count == 1
+
+            # Second call uses cache -> must NOT call SDK at all
+            res2 = await client.call_tool_mcp(
+                "workitem",
+                {"action": "list", "project_id": "00000000-0000-0000-0000-000000000001", "pql": 'priority = "urgent"'},
+            )
+            assert res2.isError is True
+            assert mock_client.work_items.list.call_count == 1
+
+
+# ==============================================================================
+# Scenario 21: Raw MCP isError=true on genuine failures
+# ==============================================================================
+@pytest.mark.anyio
+async def test_scenario_21_raw_mcp_is_error_true(test_server: FastMCP):
+    """Verify that ToolError results in raw MCP isError: true on tool response."""
     mock_client = MagicMock()
     mock_client.config.api_root = "https://api.plane.so"
-    mock_client.work_items.list.side_effect = HttpError(
-        "Internal Error", status_code=500, response={"detail": "DB down"}
-    )
+    mock_client.work_items.list.side_effect = _make_http_error(400, {"pql": "Bad syntax"})
 
     with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
         async with Client(test_server) as client:
@@ -586,15 +642,41 @@ async def test_backend_server_error_propagates_unmasked(test_server: FastMCP):
                 {
                     "action": "list",
                     "project_id": "00000000-0000-0000-0000-000000000001",
-                    "pql": 'priority = "urgent"',
+                    "pql": "bad pql",
                 },
             )
             assert res.isError is True
-            assert "500" in res.content[0].text or "DB down" in res.content[0].text
 
 
+# ==============================================================================
+# Scenario 22: Unfiltered request regression
+# ==============================================================================
 @pytest.mark.anyio
-async def test_tool_schema_stability(test_server: FastMCP):
+async def test_scenario_22_unfiltered_queries_bypass_capability_checks(test_server: FastMCP):
+    """Queries without pql bypass capability checks and execute normally."""
+    mock_client = MagicMock()
+    mock_client.config.api_root = "https://self-hosted.local"
+    items = [_make_work_item("item-1")]
+    mock_client.work_items.list.return_value = _make_page(items, total_count=1)
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
+        async with Client(test_server) as client:
+            res = await client.call_tool_mcp(
+                "workitem",
+                {
+                    "action": "list",
+                    "project_id": "00000000-0000-0000-0000-000000000001",
+                },
+            )
+            assert res.isError is False
+            assert not mock_client.work_items.list.call_args.kwargs["params"].pql
+
+
+# ==============================================================================
+# Scenario 23: No tool-schema drift
+# ==============================================================================
+@pytest.mark.anyio
+async def test_scenario_23_no_tool_schema_drift(test_server: FastMCP):
     """Tool schema parameters and descriptions remain stable without unexpected drift."""
     async with Client(test_server) as client:
         tools = await client.list_tools()

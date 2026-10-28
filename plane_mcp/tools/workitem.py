@@ -285,7 +285,13 @@ def register(mcp: FastMCP) -> None:
             if action == "list_archived" and not project_id:
                 return missing(action, "project_id")
             if pql and pql.strip():
-                if not check_pql_capability(client, workspace_slug, project_id):
+                surface = f"workitem.{action}" if project_id else "workitem.list_workspace"
+                if not check_pql_capability(
+                    client,
+                    workspace_slug,
+                    project_id=project_id,
+                    surface=surface,
+                ):
                     reject_ce_pql(
                         pql,
                         reason="PQL filtering is not supported on this Plane installation.",
@@ -322,6 +328,21 @@ def register(mcp: FastMCP) -> None:
 
         if action == "count":
             scoped = _scoped_pql(pql, project_id)
+            if scoped and scoped.strip():
+                if not check_pql_capability(
+                    client,
+                    workspace_slug,
+                    project_id=project_id,
+                    surface="workitem.count",
+                    probe_fn=lambda: client.work_items.count_workspace(
+                        workspace_slug=workspace_slug,
+                        params=WorkItemCountQueryParams(pql="(((pql_probe_syntax_check"),
+                    ),
+                ):
+                    reject_ce_pql(
+                        scoped,
+                        reason="PQL filtering is not supported on workitem.count in Plane CE.",
+                    )
             try:
                 response = client.work_items.count_workspace(
                     workspace_slug=workspace_slug,

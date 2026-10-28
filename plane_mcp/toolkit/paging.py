@@ -10,8 +10,11 @@ to these endpoints needs the same envelope and the same 400-on-bad-PQL answer.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import time
 from typing import Any
+from urllib.parse import urlparse
 
 from fastmcp.exceptions import ToolError
 from fastmcp.utilities.logging import get_logger
@@ -81,12 +84,16 @@ def envelope(response: Any, fields: str | None = None) -> dict[str, Any]:
 def reject_ce_pql(pql: str, reason: str = "") -> None:
     """Explicitly refuse a PQL query on installations or endpoints that do not support PQL filtering."""
     msg = reason or "PQL filtering is not supported on this Plane installation."
+    display_pql = pql if len(pql) <= 80 else f"{pql[:77]}..."
     raise ToolError(
-        f"{msg} No filtered result was returned. Failed PQL: {pql!r}. Remove pql or use client-side filtering."
+        f"{msg} No filtered result was returned. Failed PQL: {display_pql!r}. Remove pql or use client-side filtering."
     )
 
 
-_PQL_CAPABILITY_CACHE: dict[str, bool] = {}
+_MAX_CACHE_SIZE = 256
+_CACHE_TTL_SECONDS = 1800  # 30 minutes
+# Map: cache_key -> (result: bool, timestamp: float)
+_PQL_CAPABILITY_CACHE: dict[str, tuple[bool, float]] = {}
 
 
 def reset_pql_capability_cache() -> None:
@@ -94,56 +101,145 @@ def reset_pql_capability_cache() -> None:
     _PQL_CAPABILITY_CACHE.clear()
 
 
+def _set_capability_cache(key: str, value: bool) -> None:
+    if len(_PQL_CAPABILITY_CACHE) >= _MAX_CACHE_SIZE:
+        oldest_key = next(iter(_PQL_CAPABILITY_CACHE))
+        _PQL_CAPABILITY_CACHE.pop(oldest_key, None)
+    _PQL_CAPABILITY_CACHE[key] = (value, time.monotonic())
+
+
+def _is_plane_cloud(client: Any) -> bool:
+    """Exact hostname check for official Plane Cloud (api.plane.so)."""
+    cfg = getattr(client, "config", None)
+    for attr in ("api_root", "base_path"):
+        val = getattr(cfg, attr, None)
+        if isinstance(val, str) and val.strip():
+            try:
+                host = urlparse(val).hostname
+                if host == "api.plane.so":
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def _operator_override() -> bool | None:
+    """Operator configuration assertion via environment variable.
+
+    Note: PLANE_SUPPORTS_PQL represents an explicit operator assertion, not an
+    independently verified backend capability.
+    """
+    for var in ("PLANE_SUPPORTS_PQL", "PLANE_CAPABILITY_PQL"):
+        val = os.getenv(var)
+        if val is not None and val.strip():
+            norm = val.strip().lower()
+            if norm in ("true", "1", "yes"):
+                return True
+            if norm in ("false", "0", "no"):
+                return False
+            logger.warning(
+                "Unrecognized %s=%r: must be 'true'/'1'/'yes' or 'false'/'0'/'no'. Treating as unasserted.",
+                var,
+                val,
+            )
+    return None
+
+
+def _auth_fingerprint(client: Any) -> str:
+    cfg = getattr(client, "config", None)
+    api_key = getattr(cfg, "api_key", None)
+    if not isinstance(api_key, str):
+        api_key = None
+    access_token = getattr(cfg, "access_token", None)
+    if not isinstance(access_token, str):
+        access_token = None
+    token = api_key or access_token
+    if isinstance(token, str) and token:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+    return "anon"
+
+
 def check_pql_capability(
     client: Any,
     workspace_slug: str,
     project_id: str | None = None,
+    surface: str = "workitem.list",
+    probe_fn: Any = None,
 ) -> bool:
     """Determine whether the connected Plane backend reliably evaluates PQL filters.
 
     Returns True if confirmed supported, False if confirmed unsupported or silently ignored.
+    Raises HttpError or infrastructure exceptions if the probe fails due to auth or network errors.
     """
-    if type(client).__name__ == "SpyClient":
-        return True
-
-    env_override = os.getenv("PLANE_SUPPORTS_PQL") or os.getenv("PLANE_CAPABILITY_PQL")
+    env_override = _operator_override()
     if env_override is not None:
-        return env_override.strip().lower() in ("true", "1", "yes")
+        return env_override
+
+    if _is_plane_cloud(client):
+        return True
 
     api_root = getattr(getattr(client, "config", None), "api_root", None)
-    if isinstance(api_root, str) and "api.plane.so" in api_root:
-        return True
-    base_path = getattr(getattr(client, "config", None), "base_path", None)
-    if isinstance(base_path, str) and "api.plane.so" in base_path:
-        return True
+    endpoint_id = api_root if isinstance(api_root, str) and api_root else str(id(client))
+    auth_fp = _auth_fingerprint(client)
+    cache_key = f"{endpoint_id}:{workspace_slug}:{surface}:{auth_fp}"
 
-    cache_key = f"{api_root if isinstance(api_root, str) else id(client)}:{workspace_slug}"
+    now = time.monotonic()
     if cache_key in _PQL_CAPABILITY_CACHE:
-        return _PQL_CAPABILITY_CACHE[cache_key]
+        val, ts = _PQL_CAPABILITY_CACHE[cache_key]
+        if now - ts < _CACHE_TTL_SECONDS:
+            return val
+        del _PQL_CAPABILITY_CACHE[cache_key]
 
-    if not project_id or not hasattr(client, "work_items"):
-        return True
+    if probe_fn is None:
+        if not hasattr(client, "work_items"):
+            return False
+        if project_id:
+
+            def probe_fn():
+                return client.work_items.list(
+                    workspace_slug=workspace_slug,
+                    project_id=project_id,
+                    params=WorkItemQueryParams(pql="(((pql_probe_syntax_check", per_page=1),
+                )
+
+        else:
+
+            def probe_fn():
+                return client.work_items.list_workspace(
+                    workspace_slug=workspace_slug,
+                    params=WorkItemQueryParams(pql="(((pql_probe_syntax_check", per_page=1),
+                )
 
     try:
-        client.work_items.list(
-            workspace_slug=workspace_slug,
-            project_id=project_id,
-            params=WorkItemQueryParams(pql="(((pql_probe_syntax_check", per_page=1),
-        )
-        _PQL_CAPABILITY_CACHE[cache_key] = False
+        probe_fn()
+        # If the probe returns HTTP 200 without error, the backend SILENTLY IGNORED the malformed PQL!
+        _set_capability_cache(cache_key, False)
         return False
     except HttpError as exc:
         if exc.status_code == 400:
-            response_data = exc.response if isinstance(exc.response, dict) else {}
-            resp_str = str(response_data).lower()
-            if "not supported on this plane edition" in resp_str or "unsupported_parameters" in response_data:
-                _PQL_CAPABILITY_CACHE[cache_key] = False
+            resp = exc.response if isinstance(exc.response, dict) else {}
+            resp_str = str(resp).lower()
+            # Explicit CE edition refusal (Plane CE >= 1.4.1)
+            if "not supported on this plane edition" in resp_str or "unsupported_parameters" in resp:
+                _set_capability_cache(cache_key, False)
                 return False
-            _PQL_CAPABILITY_CACHE[cache_key] = True
-            return True
+            # Check if backend explicitly complained about the broken probe PQL syntax
+            complaint = _filter_complaint(resp)
+            if complaint is not None:
+                _set_capability_cache(cache_key, True)
+                return True
+            # Unrelated 400 (e.g. invalid project UUID format, bad per_page)
+            # MUST NOT be treated as proof of PQL support!
+            raise
+        if exc.status_code == 404:
+            if surface in ("workitem.list_workspace", "workitem.count"):
+                # Workspace-wide route does not exist on this Plane edition
+                _set_capability_cache(cache_key, False)
+                return False
+            # For project-scoped resources, 404 indicates parent record not found
+            raise
+        # Auth (401/403), rate-limit (429), server errors (5xx) must propagate unmasked
         raise
-    except Exception:
-        return False
 
 
 def workitem_page(
@@ -165,7 +261,16 @@ def workitem_page(
         plane_client = client or getattr(getattr(method, "__self__", None), "_client", None)
         workspace_slug = target.get("workspace_slug", "")
         project_id = target.get("project_id", "")
-        if not check_pql_capability(plane_client, workspace_slug, project_id):
+        if not check_pql_capability(
+            plane_client,
+            workspace_slug,
+            project_id=project_id,
+            surface=f"{tool}.{action}",
+            probe_fn=lambda: method(
+                **target,
+                params=WorkItemQueryParams(pql="(((pql_probe_syntax_check", per_page=1),
+            ),
+        ):
             reject_ce_pql(pql, reason=f"PQL filtering is not supported on {tool}.{action} in Plane CE.")
     try:
         response = method(
