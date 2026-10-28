@@ -181,14 +181,15 @@ class PlaneReadOnlyMiddleware(Middleware):
 
         known = self._allowed.get(resource)
         if known is None:
-            return f"Error: Plane MCP read-only mode blocks an unrecognised tool '{tool}'."
+            tool_desc = tool[:64] if isinstance(tool, str) and tool else "unknown"
+            return f"Error: Plane MCP read-only mode blocks an unrecognised tool '{tool_desc}'."
 
         if action is None and len(known) == 1:
             action = next(iter(known))
 
         if not isinstance(action, str) or not known.get(action, False):
             # Deliberately do not echo arguments, which might contain private data.
-            action_desc = action if isinstance(action, str) and action else "unknown"
+            action_desc = action[:64] if isinstance(action, str) and action else "unknown"
             return f"Error: Plane MCP read-only mode blocks {resource}.{action_desc}."
         return None
 

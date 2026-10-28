@@ -451,3 +451,82 @@ async def test_raw_mcp_protocol_error_contract(monkeypatch: pytest.MonkeyPatch):
         assert len(raw.content) == 1
         assert raw.content[0].type == "text"
         assert raw.content[0].text == "Error: Plane MCP read-only mode blocks workitem.create."
+
+
+@pytest.mark.anyio
+async def test_action_and_tool_name_truncation_bounds_refusal_reflection(
+    monkeypatch: pytest.MonkeyPatch, middleware: PlaneReadOnlyMiddleware, spy: SpyClient
+):
+    """Verify user-controlled action and tool names are bounded in refusal messages to prevent log/memory bloat."""
+    monkeypatch.setenv("PLANE_READ_ONLY", "true")
+    monkeypatch.setenv("PLANE_API_KEY", "test-key")
+    monkeypatch.setenv("PLANE_WORKSPACE_SLUG", "test-ws")
+
+    # 1. Direct middleware unit assertions
+    long_action = "a" * 200
+    refusal_action = middleware.rejection("workitem", {"action": long_action})
+    assert refusal_action == f"Error: Plane MCP read-only mode blocks workitem.{'a' * 64}."
+    assert long_action not in refusal_action
+
+    long_tool = "tool_" + "x" * 200
+    refusal_tool = middleware.rejection(long_tool, {})
+    assert refusal_tool == f"Error: Plane MCP read-only mode blocks an unrecognised tool '{long_tool[:64]}'."
+    assert long_tool not in refusal_tool
+
+    # Normal-length unknown action is preserved intact
+    assert (
+        middleware.rejection("workitem", {"action": "custom_unknown_action"})
+        == "Error: Plane MCP read-only mode blocks workitem.custom_unknown_action."
+    )
+
+    # 2. End-to-end client protocol assertions
+    server = get_stdio_mcp()
+    async with Client(server) as client:
+        # Long action rejection has is_error=True and bounded text
+        raw = await client.call_tool(
+            "workitem",
+            {"action": "action_" + "z" * 150, "project_id": "p1"},
+            raise_on_error=False,
+        )
+        assert raw.is_error is True
+        assert raw.content[0].text == f"Error: Plane MCP read-only mode blocks workitem.{('action_' + 'z' * 150)[:64]}."
+
+        # Known write action is refused normally
+        raw_write = await client.call_tool(
+            "workitem",
+            {"action": "create", "project_id": "p1", "name": "Item"},
+            raise_on_error=False,
+        )
+        assert raw_write.is_error is True
+        assert raw_write.content[0].text == "Error: Plane MCP read-only mode blocks workitem.create."
+
+        # Known read action succeeds
+        raw_read = await client.call_tool(
+            "workitem",
+            {"action": "retrieve", "project_id": "p1", "workitem_id": "w1"},
+            raise_on_error=False,
+        )
+        assert raw_read.is_error is False
+
+        # Legacy aliases behave consistently
+        raw_alias_write = await client.call_tool(
+            "create_work_item", {"project_id": "p1", "name": "Item"}, raise_on_error=False
+        )
+        assert raw_alias_write.is_error is True
+        assert raw_alias_write.content[0].text == "Error: Plane MCP read-only mode blocks workitem.create."
+
+        raw_alias_read = await client.call_tool(
+            "retrieve_work_item", {"project_id": "p1", "work_item_id": "w1"}, raise_on_error=False
+        )
+        assert raw_alias_read.is_error is False
+
+    # Assert zero mutating calls reached SpyClient
+    mutating_calls = [
+        c
+        for c in spy.recorder.calls
+        if not any(
+            c.method.endswith(f".{read_method}")
+            for read_method in ("retrieve", "list", "get_me", "get_features", "summary", "count")
+        )
+    ]
+    assert len(mutating_calls) == 0, f"Mutating calls reached SDK: {mutating_calls}"
