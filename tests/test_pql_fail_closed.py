@@ -1,6 +1,6 @@
 """Deterministic tests for PQL fail-closed behavior, capability detection, and error handling.
 
-Covers all 23 audit verification scenarios:
+Covers all 27 audit verification scenarios:
 1. CE HTTP 200 ignored PQL.
 2. CE HTTP 400 unsupported PQL.
 3. Cloud valid PQL.
@@ -24,6 +24,10 @@ Covers all 23 audit verification scenarios:
 21. Raw MCP isError=true on genuine failures.
 22. Unfiltered request regression.
 23. No tool-schema drift.
+24. Archived work-item endpoint probes exact target.
+25. Project-scoped count without explicit PQL on CE fails closed truthfully.
+26. Unfiltered workspace count bypasses capability checks.
+27. Cache eviction is insertion-order FIFO.
 """
 
 from __future__ import annotations
@@ -689,3 +693,122 @@ async def test_scenario_23_no_tool_schema_drift(test_server: FastMCP):
         assert "action" in props
         assert "project_id" in props
         assert props["pql"].get("type") == "string"
+
+
+# ==============================================================================
+# Scenario 24: Archived work-item endpoint probes exact target
+# ==============================================================================
+@pytest.mark.anyio
+async def test_scenario_24_archived_workitem_probes_exact_endpoint(test_server: FastMCP):
+    """workitem.list_archived capability probe targets list_archived, not list."""
+    mock_client = MagicMock()
+    mock_client.config.api_root = "https://self-hosted.local"
+    # CE list_archived returns 200 (silent ignore)
+    mock_client.work_items.list_archived.return_value = _make_page([])
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
+        async with Client(test_server) as client:
+            res = await client.call_tool_mcp(
+                "workitem",
+                {
+                    "action": "list_archived",
+                    "project_id": "00000000-0000-0000-0000-000000000001",
+                    "pql": 'priority = "urgent"',
+                },
+            )
+            assert res.isError is True
+            assert "PQL filtering is not supported" in res.content[0].text
+            # Assert exact probe method dispatched
+            assert mock_client.work_items.list_archived.called
+            assert not mock_client.work_items.list.called
+            probe_params = mock_client.work_items.list_archived.call_args.kwargs["params"]
+            assert probe_params.pql == "(((pql_probe_syntax_check"
+            assert probe_params.per_page == 1
+
+
+# ==============================================================================
+# Scenario 25: Project-scoped count without explicit PQL on CE
+# ==============================================================================
+@pytest.mark.anyio
+async def test_scenario_25_project_scoped_count_without_pql_fails_closed_truthfully(test_server: FastMCP):
+    """workitem.count with project_id but NO pql fails closed on CE with truthful diagnostic."""
+    mock_client = MagicMock()
+    mock_client.config.api_root = "https://self-hosted.local"
+    count_resp = MagicMock()
+    count_resp.model_dump.return_value = {"total_count": 500}
+    mock_client.work_items.count_workspace.return_value = count_resp
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
+        async with Client(test_server) as client:
+            res = await client.call_tool_mcp(
+                "workitem",
+                {
+                    "action": "count",
+                    "project_id": "00000000-0000-0000-0000-000000000001",
+                },
+            )
+            assert res.isError is True
+            err_text = res.content[0].text
+            assert (
+                "Project-scoped workitem count relies on PQL filtering, which is not supported on "
+                "workitem.count in Plane CE" in err_text
+            )
+            assert (
+                "Cannot count project '00000000-0000-0000-0000-000000000001' without returning an "
+                "inaccurate workspace-wide total" in err_text
+            )
+            assert "Remove pql" not in err_text
+
+
+# ==============================================================================
+# Scenario 26: Unfiltered workspace count bypasses capability checks
+# ==============================================================================
+@pytest.mark.anyio
+async def test_scenario_26_unfiltered_workspace_count_bypasses_probe(test_server: FastMCP):
+    """workitem.count workspace-wide without project_id or pql runs unfiltered without probe."""
+    mock_client = MagicMock()
+    mock_client.config.api_root = "https://self-hosted.local"
+    count_resp = MagicMock()
+    count_resp.model_dump.return_value = {"total_count": 123}
+    mock_client.work_items.count_workspace.return_value = count_resp
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(mock_client, "test-ws")):
+        async with Client(test_server) as client:
+            res = await client.call_tool_mcp(
+                "workitem",
+                {
+                    "action": "count",
+                },
+            )
+            assert res.isError is False
+            assert json.loads(res.content[0].text) == {"total_count": 123}
+            # Only one call to count_workspace (no probe call)
+            assert mock_client.work_items.count_workspace.call_count == 1
+            call_params = mock_client.work_items.count_workspace.call_args.kwargs["params"]
+            assert call_params.pql is None
+
+
+# ==============================================================================
+# Scenario 27: Cache eviction is insertion-order FIFO
+# ==============================================================================
+def test_scenario_27_cache_eviction_is_bounded_fifo():
+    """Verify that capability cache enforces bounded size and FIFO eviction."""
+    from plane_mcp.toolkit.paging import (
+        _MAX_CACHE_SIZE,
+        _PQL_CAPABILITY_CACHE,
+        _set_capability_cache,
+    )
+
+    reset_pql_capability_cache()
+    for i in range(_MAX_CACHE_SIZE):
+        _set_capability_cache(f"key-{i}", True)
+
+    assert len(_PQL_CAPABILITY_CACHE) == _MAX_CACHE_SIZE
+    assert "key-0" in _PQL_CAPABILITY_CACHE
+
+    # Insert 257th entry
+    _set_capability_cache("key-256", True)
+    assert len(_PQL_CAPABILITY_CACHE) == _MAX_CACHE_SIZE
+    # Oldest inserted entry key-0 was evicted
+    assert "key-0" not in _PQL_CAPABILITY_CACHE
+    assert "key-256" in _PQL_CAPABILITY_CACHE

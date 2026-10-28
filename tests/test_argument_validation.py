@@ -21,6 +21,8 @@ import pytest
 from plane_mcp.middleware import ValidateActionArguments
 from plane_mcp.tools.registry import action_arguments
 
+os.environ["PLANE_BASE_URL"] = "https://api.plane.so"
+os.environ.pop("PLANE_INTERNAL_BASE_URL", None)
 os.environ.setdefault("PLANE_API_KEY", "test")
 os.environ.setdefault("PLANE_WORKSPACE_SLUG", "test")
 

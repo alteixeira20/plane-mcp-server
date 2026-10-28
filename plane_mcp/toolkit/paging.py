@@ -92,7 +92,8 @@ def reject_ce_pql(pql: str, reason: str = "") -> None:
 
 _MAX_CACHE_SIZE = 256
 _CACHE_TTL_SECONDS = 1800  # 30 minutes
-# Map: cache_key -> (result: bool, timestamp: float)
+# Bounded FIFO cache: cache_key -> (result: bool, timestamp: float)
+# Evicts oldest inserted entry when capacity is reached.
 _PQL_CAPABILITY_CACHE: dict[str, tuple[bool, float]] = {}
 
 
@@ -102,6 +103,7 @@ def reset_pql_capability_cache() -> None:
 
 
 def _set_capability_cache(key: str, value: bool) -> None:
+    """Record capability status with insertion-order FIFO eviction when capacity is reached."""
     if len(_PQL_CAPABILITY_CACHE) >= _MAX_CACHE_SIZE:
         oldest_key = next(iter(_PQL_CAPABILITY_CACHE))
         _PQL_CAPABILITY_CACHE.pop(oldest_key, None)
@@ -109,7 +111,11 @@ def _set_capability_cache(key: str, value: bool) -> None:
 
 
 def _is_plane_cloud(client: Any) -> bool:
-    """Exact hostname check for official Plane Cloud (api.plane.so)."""
+    """Exact hostname check for official Plane Cloud (api.plane.so).
+
+    Note: Skipping probe round-trips for api.plane.so relies on the documented
+    service-level capability assumption that Plane Cloud implements PQL on all supported surfaces.
+    """
     cfg = getattr(client, "config", None)
     for attr in ("api_root", "base_path"):
         val = getattr(cfg, attr, None)
@@ -126,8 +132,8 @@ def _is_plane_cloud(client: Any) -> bool:
 def _operator_override() -> bool | None:
     """Operator configuration assertion via environment variable.
 
-    Note: PLANE_SUPPORTS_PQL represents an explicit operator assertion, not an
-    independently verified backend capability.
+    Note: PLANE_SUPPORTS_PQL represents an explicit operator configuration assertion,
+    not an independently verified backend capability or proof of filtering.
     """
     for var in ("PLANE_SUPPORTS_PQL", "PLANE_CAPABILITY_PQL"):
         val = os.getenv(var)
@@ -166,10 +172,18 @@ def check_pql_capability(
     surface: str = "workitem.list",
     probe_fn: Any = None,
 ) -> bool:
-    """Determine whether the connected Plane backend reliably evaluates PQL filters.
+    """Determine whether the connected Plane backend evaluates PQL queries on this surface.
 
-    Returns True if confirmed supported, False if confirmed unsupported or silently ignored.
-    Raises HttpError or infrastructure exceptions if the probe fails due to auth or network errors.
+    Evaluation semantics:
+    - Operator override (PLANE_SUPPORTS_PQL): Returns the operator's explicit assertion.
+    - Official Plane Cloud (api.plane.so): Returns True based on the documented service capability.
+    - Self-hosted probe (sending malformed PQL):
+      * HTTP 200: Parameter was silently ignored (Plane CE <= 1.3.1) -> returns False.
+      * HTTP 400 with edition refusal: Explicitly unsupported on CE (Plane CE >= 1.4.1) -> returns False.
+      * HTTP 400 with PQL syntax complaint: Confirms backend PQL lexer/parser is active on this route -> returns True.
+        (Note: Confirms syntactic parser presence, not complete semantic execution of all arbitrary operators.)
+      * HTTP 404 on workspace-wide routes: Route is absent on this edition -> returns False.
+      * HTTP 401/403 (auth), HTTP 404 (missing project), 429, 5xx, or network timeouts: Propagated unmasked.
     """
     env_override = _operator_override()
     if env_override is not None:

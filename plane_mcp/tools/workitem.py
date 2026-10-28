@@ -286,11 +286,22 @@ def register(mcp: FastMCP) -> None:
                 return missing(action, "project_id")
             if pql and pql.strip():
                 surface = f"workitem.{action}" if project_id else "workitem.list_workspace"
+                probe_fn = None
+                if action == "list_archived":
+
+                    def probe_fn():
+                        return client.work_items.list_archived(
+                            workspace_slug=workspace_slug,
+                            project_id=project_id,
+                            params=WorkItemQueryParams(pql="(((pql_probe_syntax_check", per_page=1),
+                        )
+
                 if not check_pql_capability(
                     client,
                     workspace_slug,
                     project_id=project_id,
                     surface=surface,
+                    probe_fn=probe_fn,
                 ):
                     reject_ce_pql(
                         pql,
@@ -327,6 +338,7 @@ def register(mcp: FastMCP) -> None:
             return envelope(response, opt(fields))
 
         if action == "count":
+            has_user_pql = bool(pql and pql.strip())
             scoped = _scoped_pql(pql, project_id)
             if scoped and scoped.strip():
                 if not check_pql_capability(
@@ -339,6 +351,13 @@ def register(mcp: FastMCP) -> None:
                         params=WorkItemCountQueryParams(pql="(((pql_probe_syntax_check"),
                     ),
                 ):
+                    if not has_user_pql and project_id:
+                        raise ToolError(
+                            "Project-scoped workitem count relies on PQL filtering, which is not supported on "
+                            "workitem.count in Plane CE. "
+                            f"Cannot count project {project_id!r} without returning an inaccurate workspace-wide "
+                            f"total. List work items with project_id={project_id!r} or use client-side counting."
+                        )
                     reject_ce_pql(
                         scoped,
                         reason="PQL filtering is not supported on workitem.count in Plane CE.",
