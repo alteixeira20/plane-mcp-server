@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Collection
 from typing import Any
 
+from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.server.middleware.logging import StructuredLoggingMiddleware
 from fastmcp.tools.tool import ToolResult
@@ -163,6 +164,7 @@ class PlaneReadOnlyMiddleware(Middleware):
         allowed: dict[str, dict[str, bool]] | None = None,
         aliases: dict[str, tuple[str, str]] | None = None,
     ) -> None:
+        """Initialize read-only middleware with allowed resource actions and legacy aliases."""
         self._allowed: dict[str, dict[str, bool]] = (
             allowed if allowed is not None else {mod.NAME: {a.name: a.read for a in mod.ACTIONS} for mod in RESOURCES}
         )
@@ -197,5 +199,5 @@ class PlaneReadOnlyMiddleware(Middleware):
         args = getattr(message, "arguments", None)
         if reason := self.rejection(name, args):
             logger.warning("Plane MCP: read-only policy blocked call to %s", name)
-            return ToolResult(content=reason)
+            raise ToolError(reason)
         return await call_next(context)

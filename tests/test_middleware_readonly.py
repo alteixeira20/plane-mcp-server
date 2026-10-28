@@ -14,8 +14,6 @@ Verifies:
 
 from __future__ import annotations
 
-import logging
-
 import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
@@ -42,18 +40,23 @@ def test_is_read_only_truthy_values(monkeypatch: pytest.MonkeyPatch, val: str):
     assert is_read_only() is True
 
 
-@pytest.mark.parametrize("val", ["false", "0", "no", "", "off"])
+@pytest.mark.parametrize("val", ["false", "False", "0", "no", "NO", "off", "OFF", "", "   ", " false "])
 def test_is_read_only_falsy_values(monkeypatch: pytest.MonkeyPatch, val: str):
     monkeypatch.setenv("PLANE_READ_ONLY", val)
     assert is_read_only() is False
 
 
-def test_is_read_only_warns_on_unrecognized_value(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture):
+@pytest.mark.parametrize("val", ["ture", "random", "enabled", "2", "none", "read-only"])
+def test_is_read_only_fails_fast_on_invalid_values(monkeypatch: pytest.MonkeyPatch, val: str):
+    monkeypatch.setenv("PLANE_READ_ONLY", val)
+    with pytest.raises(ValueError, match="Invalid PLANE_READ_ONLY value"):
+        is_read_only()
+
+
+def test_server_startup_fails_fast_on_invalid_read_only_config(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("PLANE_READ_ONLY", "ture")
-    monkeypatch.setattr(logging.getLogger("fastmcp"), "propagate", True)
-    with caplog.at_level(logging.WARNING):
-        assert is_read_only() is False
-    assert "PLANE_READ_ONLY has an unrecognised value 'ture'" in caplog.text
+    with pytest.raises(ValueError, match="Invalid PLANE_READ_ONLY value 'ture'"):
+        get_stdio_mcp()
 
 
 def test_server_configured_without_read_only_middleware_by_default(monkeypatch: pytest.MonkeyPatch):
@@ -288,9 +291,20 @@ async def test_read_only_mode_blocks_writes_before_sdk(monkeypatch: pytest.Monke
 
     async with Client(server) as client:
         for tool_name, arguments in write_calls:
-            result = await client.call_tool(tool_name, arguments)
+            # 1. Standard client call raises ToolError with genuine error semantics
+            with pytest.raises(ToolError) as exc_info:
+                await client.call_tool(tool_name, arguments)
+            assert "Error: Plane MCP read-only mode blocks" in str(exc_info.value), (
+                f"Expected read-only refusal in ToolError for {tool_name}"
+            )
+
+            # 2. Raw MCP protocol (raise_on_error=False) returns is_error=True
+            result = await client.call_tool(tool_name, arguments, raise_on_error=False)
+            assert result.is_error is True, f"Expected CallToolResult.is_error=True for {tool_name}"
             text = result.content[0].text if result.content else ""
-            assert "Error: Plane MCP read-only mode blocks" in text, f"Expected read-only refusal for {tool_name}"
+            assert "Error: Plane MCP read-only mode blocks" in text, (
+                f"Expected read-only refusal in CallToolResult for {tool_name}"
+            )
 
     # Assert that zero calls reached the PlaneClient / SpyClient!
     assert len(spy.recorder.calls) == 0, f"Expected 0 SDK calls, but {len(spy.recorder.calls)} were recorded"
@@ -380,14 +394,30 @@ async def test_adversarial_alias_and_metadata_bypass_attempts(monkeypatch: pytes
             text = res.content[0].text if res.content else ""
             assert "Error" in text
 
-        # 2. Uppercase or whitespace action names fail closed
-        res = await client.call_tool("workitem", {"action": "RETRIEVE", "project_id": "p1", "workitem_id": "w1"})
-        text = res.content[0].text if res.content else ""
-        assert "Error: Plane MCP read-only mode blocks workitem.RETRIEVE." in text
+        # 2. Uppercase or whitespace action names fail closed with genuine error semantics
+        with pytest.raises(ToolError) as exc_info:
+            await client.call_tool("workitem", {"action": "RETRIEVE", "project_id": "p1", "workitem_id": "w1"})
+        assert "Error: Plane MCP read-only mode blocks workitem.RETRIEVE." in str(exc_info.value)
 
-        res = await client.call_tool("workitem", {"action": " retrieve", "project_id": "p1", "workitem_id": "w1"})
-        text = res.content[0].text if res.content else ""
-        assert "Error: Plane MCP read-only mode blocks workitem. retrieve." in text
+        raw_upper = await client.call_tool(
+            "workitem",
+            {"action": "RETRIEVE", "project_id": "p1", "workitem_id": "w1"},
+            raise_on_error=False,
+        )
+        assert raw_upper.is_error is True
+        assert "Error: Plane MCP read-only mode blocks workitem.RETRIEVE." in raw_upper.content[0].text
+
+        with pytest.raises(ToolError) as exc_info:
+            await client.call_tool("workitem", {"action": " retrieve", "project_id": "p1", "workitem_id": "w1"})
+        assert "Error: Plane MCP read-only mode blocks workitem. retrieve." in str(exc_info.value)
+
+        raw_ws = await client.call_tool(
+            "workitem",
+            {"action": " retrieve", "project_id": "p1", "workitem_id": "w1"},
+            raise_on_error=False,
+        )
+        assert raw_ws.is_error is True
+        assert "Error: Plane MCP read-only mode blocks workitem. retrieve." in raw_ws.content[0].text
 
     # Assert zero mutating calls reached SpyClient
     mutating_calls = [
@@ -399,3 +429,25 @@ async def test_adversarial_alias_and_metadata_bypass_attempts(monkeypatch: pytes
         )
     ]
     assert len(mutating_calls) == 0, f"Mutating calls reached SDK: {mutating_calls}"
+
+
+@pytest.mark.anyio
+async def test_raw_mcp_protocol_error_contract(monkeypatch: pytest.MonkeyPatch):
+    """Verify that rejected writes return CallToolResult with is_error=True and sanitized text."""
+    monkeypatch.setenv("PLANE_READ_ONLY", "true")
+    monkeypatch.setenv("PLANE_API_KEY", "test-key")
+    monkeypatch.setenv("PLANE_WORKSPACE_SLUG", "test-ws")
+
+    server = get_stdio_mcp()
+
+    async with Client(server) as client:
+        # Check raw result structure
+        raw = await client.call_tool(
+            "workitem",
+            {"action": "create", "project_id": "p1", "name": "Item"},
+            raise_on_error=False,
+        )
+        assert raw.is_error is True
+        assert len(raw.content) == 1
+        assert raw.content[0].type == "text"
+        assert raw.content[0].text == "Error: Plane MCP read-only mode blocks workitem.create."

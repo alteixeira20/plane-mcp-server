@@ -166,7 +166,8 @@ Error: Plane MCP read-only mode blocks workitem.create.
 
 #### Security boundaries and limitations
 
-- **Enforcement layer**: Refusals are enforced by server-side middleware prior to Plane SDK dispatch, preventing write operations regardless of client prompts or tool selection.
+- **Enforcement layer**: Refusals are enforced by server-side middleware prior to Plane SDK dispatch, raising a genuine MCP `ToolError` (`isError=true`) to block write operations at the protocol level.
+- **Fail-fast configuration**: `PLANE_READ_ONLY` strictly validates configured values at startup. Malformed or unrecognized values (e.g. `ture` or `enabled`) raise an immediate error to prevent starting in an unintended writable state, while leaving write capabilities enabled by default when the variable is unset.
 - **Process-wide scope**: `PLANE_READ_ONLY` applies server-wide to the entire running process and all sessions connected to it. It is not a per-user or per-request control.
 - **Authorization boundaries**: Read-only mode restricts tool mutations at the MCP layer, but does not replace Plane's workspace permissions or OAuth scopes. Read requests still execute using the supplied Plane credentials and remain subject to Plane's backend access controls.
 - **Idempotency**: Enforcement relies on Plane's read endpoints being non-mutating on the backend.
