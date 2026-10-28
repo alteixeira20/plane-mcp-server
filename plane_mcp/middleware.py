@@ -189,7 +189,7 @@ class PlaneReadOnlyMiddleware(Middleware):
 
         if not isinstance(action, str) or not known.get(action, False):
             # Deliberately do not echo arguments, which might contain private data.
-            action_desc = action[:64] if isinstance(action, str) and action else "unknown"
+            action_desc = action if isinstance(action, str) and action in known else "unknown"
             return f"Error: Plane MCP read-only mode blocks {resource}.{action_desc}."
         return None
 

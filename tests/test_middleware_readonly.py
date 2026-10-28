@@ -190,7 +190,7 @@ def test_malformed_and_missing_arguments_safely_handled(middleware: PlaneReadOnl
     )
     assert (
         middleware.rejection("workitem", {"action": "not_an_action"})
-        == "Error: Plane MCP read-only mode blocks workitem.not_an_action."
+        == "Error: Plane MCP read-only mode blocks workitem.unknown."
     )
 
 
@@ -200,6 +200,11 @@ def test_argument_payload_never_echoed_in_refusal(middleware: PlaneReadOnlyMiddl
     refusal = middleware.rejection("workitem", {"action": "create", "secret_content": secret})
     assert refusal is not None
     assert secret not in refusal
+
+    # Putting sensitive payloads into the action argument must also never be reflected
+    refusal_secret_action = middleware.rejection("workitem", {"action": secret})
+    assert refusal_secret_action == "Error: Plane MCP read-only mode blocks workitem.unknown."
+    assert secret not in refusal_secret_action
 
 
 # --- 3. End-to-end integration & SDK isolation tests ---
@@ -397,7 +402,7 @@ async def test_adversarial_alias_and_metadata_bypass_attempts(monkeypatch: pytes
         # 2. Uppercase or whitespace action names fail closed with genuine error semantics
         with pytest.raises(ToolError) as exc_info:
             await client.call_tool("workitem", {"action": "RETRIEVE", "project_id": "p1", "workitem_id": "w1"})
-        assert "Error: Plane MCP read-only mode blocks workitem.RETRIEVE." in str(exc_info.value)
+        assert "Error: Plane MCP read-only mode blocks workitem.unknown." in str(exc_info.value)
 
         raw_upper = await client.call_tool(
             "workitem",
@@ -405,11 +410,11 @@ async def test_adversarial_alias_and_metadata_bypass_attempts(monkeypatch: pytes
             raise_on_error=False,
         )
         assert raw_upper.is_error is True
-        assert "Error: Plane MCP read-only mode blocks workitem.RETRIEVE." in raw_upper.content[0].text
+        assert "Error: Plane MCP read-only mode blocks workitem.unknown." in raw_upper.content[0].text
 
         with pytest.raises(ToolError) as exc_info:
             await client.call_tool("workitem", {"action": " retrieve", "project_id": "p1", "workitem_id": "w1"})
-        assert "Error: Plane MCP read-only mode blocks workitem. retrieve." in str(exc_info.value)
+        assert "Error: Plane MCP read-only mode blocks workitem.unknown." in str(exc_info.value)
 
         raw_ws = await client.call_tool(
             "workitem",
@@ -417,7 +422,7 @@ async def test_adversarial_alias_and_metadata_bypass_attempts(monkeypatch: pytes
             raise_on_error=False,
         )
         assert raw_ws.is_error is True
-        assert "Error: Plane MCP read-only mode blocks workitem. retrieve." in raw_ws.content[0].text
+        assert "Error: Plane MCP read-only mode blocks workitem.unknown." in raw_ws.content[0].text
 
     # Assert zero mutating calls reached SpyClient
     mutating_calls = [
@@ -465,7 +470,7 @@ async def test_action_and_tool_name_truncation_bounds_refusal_reflection(
     # 1. Direct middleware unit assertions
     long_action = "a" * 200
     refusal_action = middleware.rejection("workitem", {"action": long_action})
-    assert refusal_action == f"Error: Plane MCP read-only mode blocks workitem.{'a' * 64}."
+    assert refusal_action == "Error: Plane MCP read-only mode blocks workitem.unknown."
     assert long_action not in refusal_action
 
     long_tool = "tool_" + "x" * 200
@@ -473,23 +478,23 @@ async def test_action_and_tool_name_truncation_bounds_refusal_reflection(
     assert refusal_tool == f"Error: Plane MCP read-only mode blocks an unrecognised tool '{long_tool[:64]}'."
     assert long_tool not in refusal_tool
 
-    # Normal-length unknown action is preserved intact
+    # Unknown actions use fixed label "unknown" rather than reflecting user-provided values
     assert (
         middleware.rejection("workitem", {"action": "custom_unknown_action"})
-        == "Error: Plane MCP read-only mode blocks workitem.custom_unknown_action."
+        == "Error: Plane MCP read-only mode blocks workitem.unknown."
     )
 
     # 2. End-to-end client protocol assertions
     server = get_stdio_mcp()
     async with Client(server) as client:
-        # Long action rejection has is_error=True and bounded text
+        # Unknown action rejection has is_error=True and fixed "unknown" label
         raw = await client.call_tool(
             "workitem",
             {"action": "action_" + "z" * 150, "project_id": "p1"},
             raise_on_error=False,
         )
         assert raw.is_error is True
-        assert raw.content[0].text == f"Error: Plane MCP read-only mode blocks workitem.{('action_' + 'z' * 150)[:64]}."
+        assert raw.content[0].text == "Error: Plane MCP read-only mode blocks workitem.unknown."
 
         # Known write action is refused normally
         raw_write = await client.call_tool(
