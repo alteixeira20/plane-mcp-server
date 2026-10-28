@@ -13,6 +13,7 @@ from plane_mcp.tools.workitem import GROUP_BY_VALUES, register
 
 @pytest.fixture
 def test_server():
+    """Provide an isolated FastMCP test server with workitem tools registered."""
     server = FastMCP("test-server")
     register(server)
     return server
