@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 import time
 from typing import Any
 from urllib.parse import urlparse
@@ -92,6 +93,7 @@ def reject_ce_pql(pql: str, reason: str = "") -> None:
 
 _MAX_CACHE_SIZE = 256
 _CACHE_TTL_SECONDS = 1800  # 30 minutes
+_PQL_CAPABILITY_CACHE_LOCK = threading.Lock()
 # Bounded FIFO cache: cache_key -> (result: bool, timestamp: float)
 # Evicts oldest inserted entry when capacity is reached.
 _PQL_CAPABILITY_CACHE: dict[str, tuple[bool, float]] = {}
@@ -99,15 +101,18 @@ _PQL_CAPABILITY_CACHE: dict[str, tuple[bool, float]] = {}
 
 def reset_pql_capability_cache() -> None:
     """Clear cached PQL capability (used for test isolation)."""
-    _PQL_CAPABILITY_CACHE.clear()
+    with _PQL_CAPABILITY_CACHE_LOCK:
+        _PQL_CAPABILITY_CACHE.clear()
 
 
 def _set_capability_cache(key: str, value: bool) -> None:
     """Record capability status with insertion-order FIFO eviction when capacity is reached."""
-    if len(_PQL_CAPABILITY_CACHE) >= _MAX_CACHE_SIZE:
-        oldest_key = next(iter(_PQL_CAPABILITY_CACHE))
-        _PQL_CAPABILITY_CACHE.pop(oldest_key, None)
-    _PQL_CAPABILITY_CACHE[key] = (value, time.monotonic())
+    with _PQL_CAPABILITY_CACHE_LOCK:
+        if len(_PQL_CAPABILITY_CACHE) >= _MAX_CACHE_SIZE:
+            oldest_key = next(iter(_PQL_CAPABILITY_CACHE), None)
+            if oldest_key is not None:
+                _PQL_CAPABILITY_CACHE.pop(oldest_key, None)
+        _PQL_CAPABILITY_CACHE[key] = (value, time.monotonic())
 
 
 def _is_plane_cloud(client: Any) -> bool:
@@ -198,11 +203,13 @@ def check_pql_capability(
     cache_key = f"{endpoint_id}:{workspace_slug}:{surface}:{auth_fp}"
 
     now = time.monotonic()
-    if cache_key in _PQL_CAPABILITY_CACHE:
-        val, ts = _PQL_CAPABILITY_CACHE[cache_key]
-        if now - ts < _CACHE_TTL_SECONDS:
-            return val
-        del _PQL_CAPABILITY_CACHE[cache_key]
+    with _PQL_CAPABILITY_CACHE_LOCK:
+        entry = _PQL_CAPABILITY_CACHE.get(cache_key)
+        if entry is not None:
+            val, ts = entry
+            if now - ts < _CACHE_TTL_SECONDS:
+                return val
+            _PQL_CAPABILITY_CACHE.pop(cache_key, None)
 
     if probe_fn is None:
         if not hasattr(client, "work_items"):

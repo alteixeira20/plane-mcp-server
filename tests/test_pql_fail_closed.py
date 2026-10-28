@@ -812,3 +812,44 @@ def test_scenario_27_cache_eviction_is_bounded_fifo():
     # Oldest inserted entry key-0 was evicted
     assert "key-0" not in _PQL_CAPABILITY_CACHE
     assert "key-256" in _PQL_CAPABILITY_CACHE
+
+
+# ==============================================================================
+# Scenario 28: Cache concurrent thread safety
+# ==============================================================================
+def test_scenario_28_cache_thread_safety():
+    """Verify that concurrent reads, writes, and expirations do not race or raise."""
+    import concurrent.futures
+
+    from plane_mcp.toolkit.paging import (
+        _set_capability_cache,
+        check_pql_capability,
+    )
+
+    reset_pql_capability_cache()
+
+    class FakeClient:
+        def __init__(self, api_root: str):
+            self.config = type("Config", (), {"api_root": api_root, "api_key": "test"})()
+
+    client = FakeClient("https://plane.internal/api")
+
+    def worker(worker_id: int):
+        for i in range(50):
+            key = f"key-{i % 10}"
+            _set_capability_cache(key, i % 2 == 0)
+            # Invoke check_pql_capability with custom probe_fn
+            check_pql_capability(
+                client,
+                workspace_slug="ws",
+                surface=f"surface-{worker_id}",
+                probe_fn=lambda: None,
+            )
+        return True
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(worker, i) for i in range(8)]
+        for f in concurrent.futures.as_completed(futures):
+            assert f.result() is True
+
+    reset_pql_capability_cache()
