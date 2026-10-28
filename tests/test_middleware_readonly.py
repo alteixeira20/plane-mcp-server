@@ -50,6 +50,7 @@ def test_is_read_only_falsy_values(monkeypatch: pytest.MonkeyPatch, val: str):
 
 def test_is_read_only_warns_on_unrecognized_value(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture):
     monkeypatch.setenv("PLANE_READ_ONLY", "ture")
+    monkeypatch.setattr(logging.getLogger("fastmcp"), "propagate", True)
     with caplog.at_level(logging.WARNING):
         assert is_read_only() is False
     assert "PLANE_READ_ONLY has an unrecognised value 'ture'" in caplog.text
