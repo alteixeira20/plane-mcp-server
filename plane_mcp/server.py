@@ -61,7 +61,7 @@ LOG_PAYLOADS = os.getenv("LOG_PAYLOADS", "true").lower() == "true"
 
 def is_read_only() -> bool:
     """True when read-only mode is explicitly enabled by environment variable."""
-    return os.getenv("PLANE_READ_ONLY", "false").lower() in (
+    return os.getenv("PLANE_READ_ONLY", "false").strip().lower() in (
         "true",
         "1",
         "yes",

@@ -22,7 +22,7 @@ from plane.models.work_items import PaginatedWorkItemResponse, WorkItem
 
 from plane_mcp.middleware import PlaneReadOnlyMiddleware
 from plane_mcp.server import _configured, get_header_mcp, get_oauth_mcp, get_stdio_mcp, is_read_only
-from plane_mcp.tools.registry import RESOURCES, alias_table
+from plane_mcp.tools.registry import RESOURCES, alias_table, unmapped_table
 from tests.tools._spyclient import SpyClient
 
 # --- 1. Configuration & Activation tests ---
@@ -33,7 +33,7 @@ def test_is_read_only_disabled_by_default(monkeypatch: pytest.MonkeyPatch):
     assert is_read_only() is False
 
 
-@pytest.mark.parametrize("val", ["true", "True", "TRUE", "1", "yes", "YES", "Yes"])
+@pytest.mark.parametrize("val", ["true", "True", "TRUE", "1", "yes", "YES", "Yes", " true ", " 1 "])
 def test_is_read_only_truthy_values(monkeypatch: pytest.MonkeyPatch, val: str):
     monkeypatch.setenv("PLANE_READ_ONLY", val)
     assert is_read_only() is True
@@ -135,6 +135,13 @@ def test_single_action_tool_without_action_parameter(middleware: PlaneReadOnlyMi
 def test_unrecognised_tool_is_safely_blocked(middleware: PlaneReadOnlyMiddleware):
     refusal = middleware.rejection("nonexistent_unknown_tool", {})
     assert refusal == "Error: Plane MCP read-only mode blocks an unrecognised tool 'nonexistent_unknown_tool'."
+
+
+def test_all_unmapped_legacy_tools_are_safely_blocked(middleware: PlaneReadOnlyMiddleware):
+    """Unmapped legacy tools are not recognized actions, so read-only must block them fail-closed."""
+    for tool_name in unmapped_table():
+        refusal = middleware.rejection(tool_name, {})
+        assert refusal == f"Error: Plane MCP read-only mode blocks an unrecognised tool '{tool_name}'."
 
 
 def test_malformed_and_missing_arguments_safely_handled(middleware: PlaneReadOnlyMiddleware):
@@ -252,6 +259,14 @@ async def test_read_only_mode_blocks_writes_before_sdk(monkeypatch: pytest.Monke
         ),
         ("workitem_type", {"action": "resolve", "project_id": "p1", "name": "Bug"}),
         ("workspace", {"action": "update_features"}),
+        ("state", {"action": "create", "project_id": "p1", "name": "Blocked State"}),
+        (
+            "workitem_property",
+            {"action": "create", "project_id": "p1", "display_name": "CustomProp", "property_type": "text"},
+        ),
+        ("customer_property", {"action": "create", "display_name": "CustomCustProp", "property_type": "text"}),
+        ("work_log", {"action": "create", "project_id": "p1", "workitem_id": "w1", "duration": 60}),
+        ("workitem_relation", {"action": "create", "project_id": "p1", "workitem_id": "w1", "workitem_ids": ["w2"]}),
         ("create_issue", {"project_id": "p1", "name": "Legacy Issue"}),
         ("delete_issue", {"project_id": "p1", "work_item_id": "w1"}),
         # Malformed / unhashable action values must be cleanly rejected before the SDK
@@ -329,3 +344,46 @@ async def test_middleware_order_preserves_validate_action_arguments(monkeypatch:
         result = await client.call_tool("workitem", {"project_id": "p1"})
         text = result.content[0].text if result.content else ""
         assert "Error: workitem requires an action. It takes:" in text
+
+
+@pytest.mark.anyio
+async def test_adversarial_alias_and_metadata_bypass_attempts(monkeypatch: pytest.MonkeyPatch, spy: SpyClient):
+    """Verify that calling a read alias with injected write action or metadata mutation cannot bypass."""
+    monkeypatch.setenv("PLANE_READ_ONLY", "true")
+    monkeypatch.setenv("PLANE_API_KEY", "test-key")
+    monkeypatch.setenv("PLANE_WORKSPACE_SLUG", "test-ws")
+
+    server = get_stdio_mcp()
+
+    async with Client(server) as client:
+        # 1. Calling a read alias with an injected write action fails before dispatching mutation to SDK
+        try:
+            res = await client.call_tool(
+                "retrieve_work_item",
+                {"project_id": "p1", "work_item_id": "w1", "action": "delete"},
+            )
+            text = res.content[0].text if res.content else ""
+            assert "Error" in text
+        except Exception as e:
+            # FastMCP transformed tool rejects unexpected action argument
+            assert "unexpected keyword argument" in str(e).lower() or "error" in str(e).lower()
+
+        # 2. Uppercase or whitespace action names fail closed
+        res = await client.call_tool("workitem", {"action": "RETRIEVE", "project_id": "p1", "workitem_id": "w1"})
+        text = res.content[0].text if res.content else ""
+        assert "Error: Plane MCP read-only mode blocks workitem.RETRIEVE." in text
+
+        res = await client.call_tool("workitem", {"action": " retrieve", "project_id": "p1", "workitem_id": "w1"})
+        text = res.content[0].text if res.content else ""
+        assert "Error: Plane MCP read-only mode blocks workitem. retrieve." in text
+
+    # Assert zero mutating calls reached SpyClient
+    mutating_calls = [
+        c
+        for c in spy.recorder.calls
+        if not any(
+            c.method.endswith(f".{read_method}")
+            for read_method in ("retrieve", "list", "get_me", "get_features", "summary", "count")
+        )
+    ]
+    assert len(mutating_calls) == 0, f"Mutating calls reached SDK: {mutating_calls}"
