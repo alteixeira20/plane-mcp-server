@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 
 from fastmcp import FastMCP
+from fastmcp.utilities.logging import get_logger
 from mcp.types import Icon
 
 from plane_mcp.auth import PlaneHeaderAuthProvider, PlaneOAuthProvider
@@ -59,13 +60,20 @@ def get_allowed_client_redirect_uris() -> list[str]:
 LOG_PAYLOADS = os.getenv("LOG_PAYLOADS", "true").lower() == "true"
 
 
+logger = get_logger(__name__)
+
+
 def is_read_only() -> bool:
     """True when read-only mode is explicitly enabled by environment variable."""
-    return os.getenv("PLANE_READ_ONLY", "false").strip().lower() in (
-        "true",
-        "1",
-        "yes",
-    )
+    raw = os.getenv("PLANE_READ_ONLY", "false").strip().lower()
+    if raw in ("true", "1", "yes"):
+        return True
+    if raw not in ("", "false", "0", "no", "off"):
+        logger.warning(
+            "Plane MCP: PLANE_READ_ONLY has an unrecognised value %r; read-only mode is DISABLED",
+            raw,
+        )
+    return False
 
 
 def _configured(mcp: FastMCP) -> FastMCP:

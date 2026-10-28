@@ -14,8 +14,11 @@ Verifies:
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from fastmcp import Client, FastMCP
+from fastmcp.exceptions import ToolError
 from plane.models.projects import Project
 from plane.models.users import UserLite
 from plane.models.work_items import PaginatedWorkItemResponse, WorkItem
@@ -39,10 +42,17 @@ def test_is_read_only_truthy_values(monkeypatch: pytest.MonkeyPatch, val: str):
     assert is_read_only() is True
 
 
-@pytest.mark.parametrize("val", ["false", "0", "no", "", "random", "off"])
+@pytest.mark.parametrize("val", ["false", "0", "no", "", "off"])
 def test_is_read_only_falsy_values(monkeypatch: pytest.MonkeyPatch, val: str):
     monkeypatch.setenv("PLANE_READ_ONLY", val)
     assert is_read_only() is False
+
+
+def test_is_read_only_warns_on_unrecognized_value(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture):
+    monkeypatch.setenv("PLANE_READ_ONLY", "ture")
+    with caplog.at_level(logging.WARNING):
+        assert is_read_only() is False
+    assert "PLANE_READ_ONLY has an unrecognised value 'ture'" in caplog.text
 
 
 def test_server_configured_without_read_only_middleware_by_default(monkeypatch: pytest.MonkeyPatch):
@@ -362,11 +372,12 @@ async def test_adversarial_alias_and_metadata_bypass_attempts(monkeypatch: pytes
                 "retrieve_work_item",
                 {"project_id": "p1", "work_item_id": "w1", "action": "delete"},
             )
+        except ToolError as e:
+            # FastMCP transformed tool rejects unexpected action argument
+            assert "unexpected keyword argument" in str(e).lower()
+        else:
             text = res.content[0].text if res.content else ""
             assert "Error" in text
-        except Exception as e:
-            # FastMCP transformed tool rejects unexpected action argument
-            assert "unexpected keyword argument" in str(e).lower() or "error" in str(e).lower()
 
         # 2. Uppercase or whitespace action names fail closed
         res = await client.call_tool("workitem", {"action": "RETRIEVE", "project_id": "p1", "workitem_id": "w1"})
