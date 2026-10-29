@@ -210,6 +210,22 @@ def test_ce_page_cursor_validation():
         _ce_page(items, cursor="", per_page=1001, model=PaginatedProjectLiteResponse)
 
 
+def test_ce_page_cursor_truncation_security():
+    """Verify that sensitive or oversized cursor values are safely truncated in errors (CE-AUDIT-005)."""
+    items = [{"id": "p1", "name": "Project 1", "identifier": "P1"}]
+    oversized_secret_cursor = "sk_live_" + "secret_token_value_abc123_" * 50
+
+    with pytest.raises(ToolError) as exc_info:
+        _ce_page(items, cursor=oversized_secret_cursor, per_page=10, model=PaginatedProjectLiteResponse)
+
+    msg = str(exc_info.value)
+    assert "Invalid CE pagination cursor" in msg
+    assert "..." in msg
+    # The full secret string must NEVER be reflected
+    assert oversized_secret_cursor not in msg
+    assert len(msg) < 150
+
+
 # ============================================================================
 # Unit Tests for list_projects_ce
 # ============================================================================
@@ -276,8 +292,9 @@ def test_list_projects_ce_detects_duplicate_ids():
     client = MagicMock()
     p1 = Project(id="p1", name="P1", identifier="P1", archived_at=None)
     client.projects.list.return_value = _make_project_page([p1, p1])
-    with pytest.raises(ToolError, match="duplicate project IDs"):
+    with pytest.raises(ToolError, match="duplicate project IDs") as exc_info:
         list_projects_ce(client, "test-ws")
+    assert "Concurrent workspace changes" in str(exc_info.value)
 
 
 def test_list_projects_ce_detects_cursor_stall():
@@ -336,6 +353,22 @@ def test_list_projects_ce_max_pages_limit():
                 for i in range(10)
             ]
             list_projects_ce(client, "test-ws")
+
+
+def test_list_projects_ce_default_bounds_unpatched():
+    """Verify that unpatched default limit caps scan at 10 pages / 1000 projects (CE-AUDIT-003)."""
+    client = MagicMock()
+    # 11 pages of 1 project each with next_page=True should hit default _MAX_PAGES (10)
+    client.projects.list.side_effect = [
+        _make_project_page(
+            [Project(id=f"p{i}", name=f"P{i}", identifier=f"P{i}", archived_at=None)],
+            next_page=True,
+            next_cursor=f"cursor-{i}",
+        )
+        for i in range(15)
+    ]
+    with pytest.raises(ToolError, match="exceeded maximum limit of 10 pages"):
+        list_projects_ce(client, "test-ws")
 
 
 # ============================================================================
@@ -418,13 +451,98 @@ def test_list_workspace_members_ce_handles_none_display_name_cleanly():
     assert [m.id for m in res_sort.results] == ["m2", "m1"]
 
 
-def test_list_workspace_members_ce_fails_closed_on_missing_filter_field():
+def test_list_workspace_members_ce_tuple_input_and_immutability():
+    """Verify tuple response sorting works without AttributeError and does not mutate caller list (CE-AUDIT-001)."""
     client = MagicMock()
-    m1 = WorkspaceMember(id="m1", first_name="Alice", is_bot=None)
-    client.workspaces.get_members.return_value = [m1]
+    m1 = WorkspaceMember(id="m1", first_name="Bob")
+    m2 = WorkspaceMember(id="m2", first_name="Alice")
+
+    # 1. Tuple input sorting
+    client.workspaces.get_members.return_value = (m1, m2)
+    res = list_workspace_members_ce(client, "test-ws", order_by="first_name")
+    assert [m.id for m in res.results] == ["m2", "m1"]
+
+    # 2. Immutability of caller-owned list
+    original_list = [m1, m2]
+    client.workspaces.get_members.return_value = original_list
+    res2 = list_workspace_members_ce(client, "test-ws", order_by="first_name")
+    assert [m.id for m in res2.results] == ["m2", "m1"]
+    # The original list passed to or returned by the client must remain untouched
+    assert original_list == [m1, m2]
+
+
+def test_list_workspace_members_ce_nullable_and_missing_field_matrix():
+    """Verify the 4-case matrix for nullable vs missing member fields (CE-AUDIT-002).
+
+    Case A: Explicitly present field with null value (legitimate non-match, does not fail).
+    Case B: Entirely missing field in an untyped dictionary (fails closed with ToolError).
+    Case C: Pydantic model field with default None when raw response omitted the field (fails closed).
+    Case D: API schema omission across records (fails closed).
+    """
+    client = MagicMock()
+
+    # Case A: Explicitly supplied null value
+    # Server returned: {"id": "m1", "first_name": "Alice", "role_slug": None, "is_bot": None}
+    m_case_a = WorkspaceMember.model_validate({"id": "m1", "first_name": "Alice", "role_slug": None, "is_bot": None})
+    m_active = WorkspaceMember.model_validate(
+        {"id": "m2", "first_name": "Admin", "role_slug": "admin", "is_bot": False}
+    )
+    client.workspaces.get_members.return_value = [m_case_a, m_active]
+
+    # Explicit null should evaluate as non-match without error, returning the matching member
+    res_role = list_workspace_members_ce(client, "test-ws", role_slug="admin")
+    assert [m.id for m in res_role.results] == ["m2"]
+
+    res_bot = list_workspace_members_ce(client, "test-ws", is_bot=False)
+    assert [m.id for m in res_bot.results] == ["m2"]
+
+    # Querying for role_slug="guest" when records are only None and "admin" yields empty results without error
+    res_none = list_workspace_members_ce(client, "test-ws", role_slug="guest")
+    assert res_none.results == []
+
+    # Case B: Entirely missing field in an untyped dictionary
+    client.workspaces.get_members.return_value = [{"id": "d1", "first_name": "DictUser"}]
+    with pytest.raises(ToolError, match="cannot reliably filter by role_slug"):
+        list_workspace_members_ce(client, "test-ws", role_slug="admin")
 
     with pytest.raises(ToolError, match="cannot reliably filter by is_bot"):
         list_workspace_members_ce(client, "test-ws", is_bot=False)
+
+    # Case C: Pydantic model where field was omitted from raw payload
+    m_omitted = WorkspaceMember(id="m_omit", first_name="OmittedFields")
+    client.workspaces.get_members.return_value = [m_omitted]
+    with pytest.raises(ToolError, match="cannot reliably filter by is_bot"):
+        list_workspace_members_ce(client, "test-ws", is_bot=False)
+
+    with pytest.raises(ToolError, match="cannot reliably filter by is_active"):
+        list_workspace_members_ce(client, "test-ws", is_active=True)
+
+    # Case D: Empty collection preserves empty-collection semantics without error
+    client.workspaces.get_members.return_value = []
+    res_empty = list_workspace_members_ce(client, "test-ws", role_slug="admin", is_active=True, is_bot=False)
+    assert res_empty.results == []
+
+
+def test_list_workspace_members_ce_descending_sort_stability():
+    """Verify null-last placement and deterministic tie-breaking in ASC and DESC (CE-AUDIT-004)."""
+    client = MagicMock()
+    m_null = WorkspaceMember(id="m_null", first_name=None)
+    m_alice1 = WorkspaceMember(id="m_alice_1", first_name="Alice")
+    m_alice2 = WorkspaceMember(id="m_alice_2", first_name="Alice")
+    m_bob = WorkspaceMember(id="m_bob", first_name="Bob")
+
+    client.workspaces.get_members.return_value = [m_null, m_alice2, m_bob, m_alice1]
+
+    # Ascending: Alice (m_alice_1, m_alice_2), Bob (m_bob), Null (m_null at the end)
+    res_asc = list_workspace_members_ce(client, "test-ws", order_by="first_name")
+    assert [m.id for m in res_asc.results] == ["m_alice_1", "m_alice_2", "m_bob", "m_null"]
+
+    # Descending: Bob (m_bob), Alice (m_alice_1, m_alice_2), Null (m_null ALWAYS at the end!)
+    res_desc = list_workspace_members_ce(client, "test-ws", order_by="-first_name")
+    assert [m.id for m in res_desc.results] == ["m_bob", "m_alice_1", "m_alice_2", "m_null"]
+    # Deterministic tie-breaker check: m_alice_1 (< m_alice_2) comes first in both ASC and DESC
+    alice_ids = [m.id for m in res_desc.results if m.first_name == "Alice"]
+    assert alice_ids == ["m_alice_1", "m_alice_2"]
 
 
 def test_list_workspace_members_ce_unsupported_order_by():
@@ -668,7 +786,7 @@ async def test_raw_mcp_is_error_member_unsupported_order_by(member_server: FastM
 async def test_raw_mcp_is_error_member_unavailable_filter_field(member_server: FastMCP):
     client = MagicMock()
     client.workspaces.get_members_lite.side_effect = _make_http_error(404, "Page not found.")
-    client.workspaces.get_members.return_value = [WorkspaceMember(id="m1", first_name="A", is_active=None)]
+    client.workspaces.get_members.return_value = [WorkspaceMember(id="m1", first_name="A")]
 
     with patch("plane_mcp.tools.member.get_plane_client_context", return_value=(client, "test-ws")):
         async with Client(member_server) as mcp_client:

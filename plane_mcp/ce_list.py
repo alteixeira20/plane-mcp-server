@@ -8,6 +8,7 @@ endpoints with honest client-side filtering and pagination envelopes.
 
 from __future__ import annotations
 
+from functools import cmp_to_key
 from math import ceil
 from typing import Any
 
@@ -15,10 +16,11 @@ from fastmcp.exceptions import ToolError
 from plane.models.projects import PaginatedProjectLiteResponse, ProjectLite
 from plane.models.query_params import PaginatedQueryParams
 from plane.models.workspaces import PaginatedWorkspaceMemberResponse
+from pydantic import BaseModel
 
-_MAX_PROJECTS = 10_000
+_MAX_PROJECTS = 1_000
 _MAX_MEMBERS = 10_000
-_MAX_PAGES = 100
+_MAX_PAGES = 10
 _BACKEND_PAGE_SIZE = 100
 _PROJECT_LITE_FIELDS = set(ProjectLite.model_fields.keys())
 
@@ -32,6 +34,26 @@ def _get_field(obj: Any, field: str, default: Any = None) -> Any:
     return default if val is None else val
 
 
+def _field_presence_and_value(obj: Any, field: str) -> tuple[bool, Any]:
+    """Distinguish between an explicitly present field (even if None) and an omitted field.
+
+    For Pydantic models, checks model_fields_set to verify the field was supplied in the raw payload.
+    For dictionaries, checks key membership.
+    For arbitrary objects, checks hasattr.
+    """
+    if isinstance(obj, BaseModel):
+        if field in obj.model_fields_set:
+            return True, getattr(obj, field)
+        return False, None
+    if isinstance(obj, dict):
+        if field in obj:
+            return True, obj[field]
+        return False, None
+    if hasattr(obj, field):
+        return True, getattr(obj, field)
+    return False, None
+
+
 def _ce_page(items: list[Any], *, cursor: str, per_page: int, model: type):
     """Create an honest lite-style envelope with CE-specific offset cursors."""
     if not 1 <= per_page <= 1000:
@@ -42,7 +64,8 @@ def _ce_page(items: list[Any], *, cursor: str, per_page: int, model: type):
     elif cursor_str.startswith("ce:") and cursor_str[3:].isascii() and cursor_str[3:].isdigit():
         offset = int(cursor_str[3:])
     else:
-        raise ToolError(f"Invalid CE pagination cursor: '{cursor}'. Expected empty string or 'ce:<offset>'.")
+        safe_cursor = f"'{cursor_str[:32]}...'" if len(cursor_str) > 32 else (f"'{cursor_str}'" if cursor_str else "''")
+        raise ToolError(f"Invalid CE pagination cursor: {safe_cursor}. Expected empty string or 'ce:<offset>'.")
 
     total = len(items)
     if offset > total:
@@ -96,8 +119,13 @@ def list_projects_ce(
             raise ToolError("CE project listing did not return a valid paginated response.")
         for project in results:
             pid = _get_field(project, "id")
-            if not pid or pid in seen_ids:
-                raise ToolError("CE project pagination returned missing or duplicate project IDs.")
+            if not pid:
+                raise ToolError("CE project pagination returned missing project IDs.")
+            if pid in seen_ids:
+                raise ToolError(
+                    "CE project pagination returned duplicate project IDs during scan. "
+                    "Concurrent workspace changes may have shifted pagination boundaries; retry the request."
+                )
             seen_ids.add(pid)
             projects.append(project)
 
@@ -149,6 +177,7 @@ def list_workspace_members_ce(
     members = client.workspaces.get_members(workspace_slug=workspace_slug)
     if not isinstance(members, (list, tuple)):
         raise ToolError("CE workspace member listing did not return a valid list.")
+    members = list(members)
     if len(members) > _MAX_MEMBERS:
         raise ToolError(f"CE workspace member listing exceeds maximum limit of {_MAX_MEMBERS} members.")
 
@@ -171,12 +200,18 @@ def list_workspace_members_ce(
     for field, value in exact_filters:
         if value is None or value == "":
             continue
-        if any(_get_field(m, field, None) is None for m in members):
-            raise ToolError(f"CE cannot reliably filter by {field}: API field unavailable on records.")
-        if field == "role_slug":
-            members = [m for m in members if _get_field(m, "role_slug") == value]
-        else:
-            members = [m for m in members if _get_field(m, field) is value]
+        filtered: list[Any] = []
+        for m in members:
+            present, val = _field_presence_and_value(m, field)
+            if not present:
+                raise ToolError(f"CE cannot reliably filter by {field}: API field unavailable on records.")
+            if field == "role_slug":
+                if val == value:
+                    filtered.append(m)
+            else:
+                if val is value:
+                    filtered.append(m)
+        members = filtered
 
     if order_by:
         reverse = order_by.startswith("-")
@@ -193,14 +228,36 @@ def list_workspace_members_ce(
                 f"Unsupported CE workspace member order_by: '{order_by}'. "
                 f"Allowed fields: {', '.join(sorted(allowed_sort_fields))}."
             )
-        members.sort(
-            key=lambda m: (
-                _get_field(m, field, None) is None,
-                str(_get_field(m, field, "")).casefold(),
-                str(_get_field(m, "id", "")),
-            ),
-            reverse=reverse,
-        )
+
+        def _member_comparator(a: Any, b: Any) -> int:
+            a_val = _get_field(a, field, None)
+            b_val = _get_field(b, field, None)
+            a_none = a_val is None
+            b_none = b_val is None
+
+            # Nulls always placed at the end in both ASC and DESC
+            if a_none and not b_none:
+                return 1
+            if b_none and not a_none:
+                return -1
+            if not a_none and not b_none:
+                a_str = str(a_val).casefold()
+                b_str = str(b_val).casefold()
+                if a_str != b_str:
+                    if reverse:
+                        return -1 if a_str > b_str else 1
+                    return -1 if a_str < b_str else 1
+
+            # Deterministic tie-breaker: always ascending ID
+            a_id = str(_get_field(a, "id", ""))
+            b_id = str(_get_field(b, "id", ""))
+            if a_id < b_id:
+                return -1
+            if a_id > b_id:
+                return 1
+            return 0
+
+        members.sort(key=cmp_to_key(_member_comparator))
 
     rows = [m.model_dump() if hasattr(m, "model_dump") else m for m in members]
     return _ce_page(
