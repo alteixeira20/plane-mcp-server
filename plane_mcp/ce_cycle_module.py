@@ -17,6 +17,8 @@ from fastmcp.exceptions import ToolError
 from plane.models.cycles import CycleLite, PaginatedCycleLiteResponse
 from plane.models.modules import ModuleLite, PaginatedModuleLiteResponse
 
+from plane_mcp.client import current_workspace
+
 _MAX_ITEMS = 1_000
 _MAX_PAGES = 10
 _BACKEND_PAGE_SIZE = 100
@@ -49,9 +51,30 @@ def _validate_scope(
     *,
     requested_project: str,
     workspace_slug: str,
+    workspace_id: str | None = None,
     resource_name: str,
 ) -> tuple[str, str]:
-    """Validate project and workspace scoping, preventing cross-project scope leakage.
+    """Validate project and workspace scoping, preventing cross-project or cross-workspace leakage.
+
+    Scope Trust Boundary:
+    - Plane's standard API endpoints are strictly scoped by URL path:
+      `/api/v1/workspaces/{workspace_slug}/projects/{project_id}/...`
+    - Project scope:
+      If the record explicitly contains a project field, it must match
+      ``requested_project``. Otherwise, the endpoint-enforced project scope is used.
+    - Workspace scope:
+      1. If the record contains a slug string matching ``workspace_slug``, it is accepted.
+      2. If an authoritative ``workspace_id`` is known (e.g. from OAuth token claims or caller),
+         a record workspace field matching ``workspace_id`` is verified and accepted.
+         Any conflicting UUID or slug is rejected.
+      3. If no authoritative ``workspace_id`` is known (e.g. API key / stdio auth where
+         credentials only specify the slug):
+         - If the record contains a UUID, it cannot be independently verified against the slug
+           without additional network requests. Under the documented trust boundary of the
+           backend's workspace/project-scoped endpoint, the record's UUID is retained without
+           claiming independent UUID identity verification.
+         - If the record contains a slug string that does not match ``workspace_slug``, it is rejected.
+      4. If the workspace field is missing or null, it defaults to ``workspace_slug``.
 
     Returns (effective_project, effective_workspace).
     """
@@ -66,12 +89,27 @@ def _validate_scope(
 
     rec_workspace = _get_field(item, "workspace")
     if rec_workspace:
-        rec_ws_str = str(rec_workspace)
-        if rec_ws_str == str(workspace_slug) or _is_uuid(rec_ws_str):
+        rec_ws_str = str(rec_workspace).strip()
+        if workspace_id is not None:
+            known_ws_id = workspace_id.strip()
+        else:
+            try:
+                known_ws_id = str(current_workspace().get("id") or "").strip()
+            except Exception:
+                known_ws_id = ""
+
+        if rec_ws_str == str(workspace_slug):
+            effective_workspace = rec_ws_str
+        elif known_ws_id and rec_ws_str == known_ws_id:
+            effective_workspace = rec_ws_str
+        elif not known_ws_id and _is_uuid(rec_ws_str):
+            # Endpoint trust boundary: preserve backend record's UUID without asserting
+            # independent identity verification, avoiding extra network requests.
             effective_workspace = rec_ws_str
         else:
             raise ToolError(f"CE {resource_name} record does not match the requested workspace scope.")
     else:
+        # Standard endpoint is strictly workspace-scoped by URL path
         effective_workspace = workspace_slug
 
     return effective_project, effective_workspace
@@ -203,6 +241,7 @@ def list_cycles_ce(
     per_page: int = 100,
     status: str = "",
     order_by: str = "",
+    workspace_id: str | None = None,
 ) -> PaginatedCycleLiteResponse:
     """Use standard cycles API, exclude archived records, and paginate honestly.
 
@@ -240,6 +279,7 @@ def list_cycles_ce(
             c,
             requested_project=project_id,
             workspace_slug=workspace_slug,
+            workspace_id=workspace_id,
             resource_name="cycle",
         )
         row["project"] = eff_proj
@@ -268,6 +308,7 @@ def list_modules_ce(
     per_page: int = 100,
     order_by: str = "",
     status: str = "",
+    workspace_id: str | None = None,
 ) -> PaginatedModuleLiteResponse:
     """Use standard modules API, exclude archived records, and paginate honestly.
 
@@ -305,6 +346,7 @@ def list_modules_ce(
             m,
             requested_project=project_id,
             workspace_slug=workspace_slug,
+            workspace_id=workspace_id,
             resource_name="module",
         )
         row["project"] = eff_proj

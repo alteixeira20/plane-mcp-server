@@ -705,27 +705,104 @@ def test_mismatched_project_scope_raises_tool_error(mock_client):
     assert "does not match the requested project scope" in str(exc_module.value)
 
 
-def test_workspace_scope_validation(mock_client):
-    """Workspace representation supports exact slug and UUIDs, rejecting foreign slugs."""
-    # Valid matching slug
-    c1 = Cycle(id="c1", name="C1", project=PROJECT_ID, workspace=WORKSPACE_SLUG, owned_by=OWNER_ID)
-    mock_client.cycles.list.return_value = [c1]
-    res1 = list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
-    assert res1.results[0].workspace == WORKSPACE_SLUG
+def test_workspace_scope_adversarial_suite(mock_client):
+    """Adversarial validation across all 8 workspace and project scope scenarios."""
+    auth_ws_uuid = "41e3ed60-d8b8-42f9-b7b3-0c888bfce2cb"
+    foreign_ws_uuid = "99999999-9999-9999-9999-999999999999"
 
-    # Valid UUID representation
-    ws_uuid = "41e3ed60-d8b8-42f9-b7b3-0c888bfce2cb"
-    c2 = Cycle(id="c2", name="C2", project=PROJECT_ID, workspace=ws_uuid, owned_by=OWNER_ID)
-    mock_client.cycles.list.return_value = [c2]
-    res2 = list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
-    assert res2.results[0].workspace == ws_uuid
+    # 1. Matching slug
+    c_slug = Cycle(id="c1", name="C1", project=PROJECT_ID, workspace=WORKSPACE_SLUG, owned_by=OWNER_ID)
+    mock_client.cycles.list.return_value = [c_slug]
+    res = list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID, workspace_id=auth_ws_uuid)
+    assert res.results[0].workspace == WORKSPACE_SLUG
 
-    # Foreign workspace slug
-    c3 = Cycle(id="c3", name="C3", project=PROJECT_ID, workspace="foreign-org-slug", owned_by=OWNER_ID)
-    mock_client.cycles.list.return_value = [c3]
-    with pytest.raises(ToolError) as exc_ws:
+    # 2. Matching UUID (authoritative workspace identity equivalence)
+    c_uuid = Cycle(id="c2", name="C2", project=PROJECT_ID, workspace=auth_ws_uuid, owned_by=OWNER_ID)
+    mock_client.cycles.list.return_value = [c_uuid]
+    res = list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID, workspace_id=auth_ws_uuid)
+    assert res.results[0].workspace == auth_ws_uuid
+
+    # 3. Foreign UUID (fails closed when authoritative workspace UUID is known)
+    c_foreign_uuid = Cycle(id="c3", name="C3", project=PROJECT_ID, workspace=foreign_ws_uuid, owned_by=OWNER_ID)
+    mock_client.cycles.list.return_value = [c_foreign_uuid]
+    with pytest.raises(ToolError) as exc_ws_uuid:
+        list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID, workspace_id=auth_ws_uuid)
+    assert "does not match the requested workspace scope" in str(exc_ws_uuid.value)
+
+    m_foreign_uuid = Module(id="m3", name="M3", project=PROJECT_ID, workspace=foreign_ws_uuid)
+    mock_client.modules.list.return_value = make_module_standard_page([m_foreign_uuid])
+    with pytest.raises(ToolError) as exc_mod_uuid:
+        list_modules_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID, workspace_id=auth_ws_uuid)
+    assert "does not match the requested workspace scope" in str(exc_mod_uuid.value)
+
+    # 4. Foreign slug (fails closed)
+    c_foreign_slug = Cycle(id="c4", name="C4", project=PROJECT_ID, workspace="foreign-org-slug", owned_by=OWNER_ID)
+    mock_client.cycles.list.return_value = [c_foreign_slug]
+    with pytest.raises(ToolError) as exc_ws_slug:
         list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
-    assert "does not match the requested workspace scope" in str(exc_ws.value)
+    assert "does not match the requested workspace scope" in str(exc_ws_slug.value)
+
+    m_foreign_slug = Module(id="m4", name="M4", project=PROJECT_ID, workspace="foreign-org-slug")
+    mock_client.modules.list.return_value = make_module_standard_page([m_foreign_slug])
+    with pytest.raises(ToolError) as exc_mod_slug:
+        list_modules_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
+    assert "does not match the requested workspace scope" in str(exc_mod_slug.value)
+
+    # 5. Missing workspace field (defaults safely to requested workspace_slug)
+    c_missing_ws = {"id": "c5", "name": "C5", "project": PROJECT_ID, "owned_by": OWNER_ID}
+    mock_client.cycles.list.return_value = [c_missing_ws]
+    res_missing = list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
+    assert res_missing.results[0].workspace == WORKSPACE_SLUG
+
+    m_missing_ws = {"id": "m5", "name": "M5", "project": PROJECT_ID}
+    mock_client.modules.list.return_value = [m_missing_ws]
+    res_mod_missing = list_modules_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
+    assert res_mod_missing.results[0].workspace == WORKSPACE_SLUG
+
+    # 6. Null workspace field (defaults safely to requested workspace_slug)
+    c_null_ws = Cycle(id="c6", name="C6", project=PROJECT_ID, workspace=None, owned_by=OWNER_ID)
+    mock_client.cycles.list.return_value = [c_null_ws]
+    res_null = list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
+    assert res_null.results[0].workspace == WORKSPACE_SLUG
+
+    m_null_ws = Module(id="m6", name="M6", project=PROJECT_ID, workspace=None)
+    mock_client.modules.list.return_value = make_module_standard_page([m_null_ws])
+    res_mod_null = list_modules_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
+    assert res_mod_null.results[0].workspace == WORKSPACE_SLUG
+
+    # 7. Correctly scoped project (both explicit and endpoint-scoped default)
+    c_proj = Cycle(id="c7", name="C7", project=PROJECT_ID, workspace=WORKSPACE_SLUG, owned_by=OWNER_ID)
+    mock_client.cycles.list.return_value = [c_proj]
+    res_proj = list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
+    assert res_proj.results[0].project == PROJECT_ID
+
+    c_no_proj = {"id": "c7b", "name": "C7b", "workspace": WORKSPACE_SLUG, "owned_by": OWNER_ID}
+    mock_client.cycles.list.return_value = [c_no_proj]
+    res_no_proj = list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
+    assert res_no_proj.results[0].project == PROJECT_ID
+
+    # 8. Mismatched project (rejected)
+    c_bad_proj = Cycle(id="c8", name="C8", project="other-project", workspace=WORKSPACE_SLUG, owned_by=OWNER_ID)
+    mock_client.cycles.list.return_value = [c_bad_proj]
+    with pytest.raises(ToolError) as exc_bad_proj:
+        list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
+    assert "does not match the requested project scope" in str(exc_bad_proj.value)
+
+    m_bad_proj = Module(id="m8", name="M8", project="other-project", workspace=WORKSPACE_SLUG)
+    mock_client.modules.list.return_value = make_module_standard_page([m_bad_proj])
+    with pytest.raises(ToolError) as exc_mod_bad_proj:
+        list_modules_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
+    assert "does not match the requested project scope" in str(exc_mod_bad_proj.value)
+
+
+def test_workspace_uuid_endpoint_trust_boundary_when_uuid_unknown(mock_client):
+    """When only workspace_slug is known (no auth UUID), retain UUID under endpoint trust boundary."""
+    record_uuid = "41e3ed60-d8b8-42f9-b7b3-0c888bfce2cb"
+    c = Cycle(id="c1", name="C1", project=PROJECT_ID, workspace=record_uuid, owned_by=OWNER_ID)
+    mock_client.cycles.list.return_value = [c]
+    # workspace_id="" explicitly signifies no known workspace UUID
+    res = list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID, workspace_id="")
+    assert res.results[0].workspace == record_uuid
 
 
 def test_premature_pagination_termination_raises_tool_error(mock_client):
