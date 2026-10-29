@@ -7,7 +7,9 @@ merging them teaches the model to filter on a field the API rejects.
 
 from __future__ import annotations
 
+import os
 from typing import Annotated, Any, Literal, get_args
+from urllib.parse import urlparse
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -177,6 +179,39 @@ LEGACY = {
     "manage_work_item_assignee": "manage_assignee",
     "manage_work_item_label": "manage_label",
 }
+
+
+def _is_plane_cloud_client(client: Any) -> bool:
+    """Exact hostname check for official Plane Cloud (api.plane.so)."""
+    cfg = getattr(client, "config", None)
+    if cfg is not None:
+        for attr in ("api_root", "base_path"):
+            val = getattr(cfg, attr, None)
+            if isinstance(val, str) and val.strip():
+                try:
+                    return urlparse(val).hostname == "api.plane.so"
+                except Exception:
+                    pass
+    env_url = os.getenv("PLANE_INTERNAL_BASE_URL") or os.getenv("PLANE_BASE_URL", "")
+    if env_url:
+        try:
+            return urlparse(env_url).hostname == "api.plane.so"
+        except Exception:
+            pass
+    return False
+
+
+def _pql_capability_established(client: Any) -> bool:
+    """Determine whether PQL capability is established without PR #259 capability engine."""
+    for var in ("PLANE_SUPPORTS_PQL", "PLANE_CAPABILITY_PQL"):
+        val = os.getenv(var)
+        if val is not None and val.strip():
+            norm = val.strip().lower()
+            if norm in ("true", "1", "yes"):
+                return True
+            if norm in ("false", "0", "no"):
+                return False
+    return _is_plane_cloud_client(client)
 
 
 def _scoped_pql(pql: str, project_id: str) -> str:
@@ -359,6 +394,22 @@ def register(mcp: FastMCP) -> None:
                         "Filtered counts are unavailable when this Plane server's count endpoint does not support PQL. "
                         "No fabricated count was returned."
                     )
+            elif scoped and scoped.strip() and not _pql_capability_established(client):
+                # Standalone safety: When PR #259 is not installed and capability cannot be
+                # reliably established (e.g. self-hosted instance without PLANE_SUPPORTS_PQL=true),
+                # fail closed to prevent silent PQL ignore on older CE backends.
+                if group_by or sub_group_by:
+                    raise ToolError(
+                        "Grouped counts are unavailable through this Plane public API. "
+                        "Project-scoped grouped counts rely on PQL filtering, which is unavailable on unverified "
+                        "self-hosted Plane backends without PR #259 capability detection. Set PLANE_SUPPORTS_PQL=true "
+                        "if your instance supports PQL, or install PR #259."
+                    )
+                raise ToolError(
+                    "Filtered counts are unavailable with explicit PQL on unverified self-hosted Plane backends "
+                    "without PR #259 capability detection. Set PLANE_SUPPORTS_PQL=true if your instance supports "
+                    "PQL, or install PR #259."
+                )
 
             try:
                 response = client.work_items.count_workspace(

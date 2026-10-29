@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -673,3 +675,273 @@ async def test_tool_workitem_count_with_pql_capability_cloud_dispatch(test_serve
             )
             assert getattr(res.data, "total_count", None) == 99 or res.data.get("total_count") == 99
             client.work_items.count_workspace.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Raw FastMCP Protocol Tests for Standalone Safety and Combined Integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_raw_mcp_standalone_ce_silent_pql_ignore_explicit_pql_fails_closed(test_server: FastMCP):
+    """Raw MCP: Standalone CE server returning 200 with ignored explicit PQL fails closed."""
+    client = MagicMock()
+    client.config.api_root = "http://ce.internal"
+    client.work_items.count_workspace.return_value = WorkItemCountResponse(
+        total_count=9999,
+        grouped_counts={},
+        grouped_by=None,
+        sub_grouped_by=None,
+    )
+
+    with (
+        patch("plane_mcp.tools.workitem.check_pql_capability", None),
+        patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")),
+    ):
+        async with Client(test_server) as client_mcp:
+            res = await client_mcp.call_tool_mcp(
+                "workitem",
+                {"action": "count", "pql": 'priority = "urgent"'},
+            )
+            assert res.isError is True
+            assert "Filtered counts are unavailable" in res.content[0].text
+            assert not client.work_items.count_workspace.called
+
+
+@pytest.mark.anyio
+async def test_raw_mcp_standalone_ce_silent_pql_ignore_synthesized_project_pql_safe(test_server: FastMCP):
+    """Raw MCP: Standalone CE server returning 200 on count_workspace uses project list count safely."""
+    client = MagicMock()
+    client.config.api_root = "http://ce.internal"
+    client.work_items.count_workspace.return_value = WorkItemCountResponse(
+        total_count=9999,
+        grouped_counts={},
+        grouped_by=None,
+        sub_grouped_by=None,
+    )
+    fake_item = WorkItem(
+        id="00000000-0000-0000-0000-000000000002",
+        name="Issue 1",
+        project="00000000-0000-0000-0000-000000000001",
+        workspace="test-ws",
+        sequence_id=1,
+    )
+    client.work_items.list.return_value = PaginatedWorkItemResponse(
+        results=[fake_item],
+        total_count=42,
+        total_results=42,
+        total_pages=1,
+        count=1,
+        next_page_results=False,
+        prev_page_results=False,
+        next_cursor="",
+        prev_cursor="",
+    )
+
+    with (
+        patch("plane_mcp.tools.workitem.check_pql_capability", None),
+        patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")),
+    ):
+        async with Client(test_server) as client_mcp:
+            res = await client_mcp.call_tool_mcp(
+                "workitem",
+                {"action": "count", "project_id": "00000000-0000-0000-0000-000000000001"},
+            )
+            assert res.isError is False
+            data = json.loads(res.content[0].text)
+            assert data["total_count"] == 42
+            assert not client.work_items.count_workspace.called
+            client.work_items.list.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_raw_mcp_ce_missing_count_route_404_protocol_semantics(test_server: FastMCP):
+    """Raw MCP: CE missing count endpoint (404) handles workspace fallback and rejects filtered/grouped."""
+    client = MagicMock()
+    client.config.api_root = "http://ce.internal"
+    client.work_items.count_workspace.side_effect = _make_http_error(404, "Page not found.")
+
+    fake_project = Project(
+        id="00000000-0000-0000-0000-000000000001",
+        name="Project 1",
+        identifier="PROJ1",
+        workspace="test-ws",
+    )
+    fake_item = WorkItem(
+        id="00000000-0000-0000-0000-000000000002",
+        name="Issue 1",
+        project="00000000-0000-0000-0000-000000000001",
+        workspace="test-ws",
+        sequence_id=1,
+    )
+    client.projects.list.return_value = PaginatedProjectResponse(
+        results=[fake_project],
+        total_count=1,
+        total_results=1,
+        total_pages=1,
+        count=1,
+        next_page_results=False,
+        prev_page_results=False,
+        next_cursor="",
+        prev_cursor="",
+    )
+    client.work_items.list.return_value = PaginatedWorkItemResponse(
+        results=[fake_item],
+        total_count=15,
+        total_results=15,
+        total_pages=1,
+        count=1,
+        next_page_results=False,
+        prev_page_results=False,
+        next_cursor="",
+        prev_cursor="",
+    )
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")):
+        async with Client(test_server) as client_mcp:
+            # 1. Workspace-wide ungrouped count falls back to active project enumeration
+            res_ws = await client_mcp.call_tool_mcp("workitem", {"action": "count"})
+            assert res_ws.isError is False
+            data = json.loads(res_ws.content[0].text)
+            assert data["total_count"] == 15
+
+            # 2. Workspace-wide grouped count on 404 fails closed
+            res_group = await client_mcp.call_tool_mcp("workitem", {"action": "count", "group_by": "state_id"})
+            assert res_group.isError is True
+            assert "Grouped counts are unavailable" in res_group.content[0].text
+
+            # 3. User PQL count on 404 fails closed (with operator override asserting PQL support)
+            with patch.dict(os.environ, {"PLANE_SUPPORTS_PQL": "true"}):
+                res_pql = await client_mcp.call_tool_mcp(
+                    "workitem",
+                    {"action": "count", "pql": 'priority = "urgent"'},
+                )
+                assert res_pql.isError is True
+                assert (
+                    "Filtered counts are unavailable when this Plane server's count endpoint is missing"
+                    in res_pql.content[0].text
+                )
+
+
+@pytest.mark.anyio
+async def test_raw_mcp_cloud_supported_pql_protocol_semantics(test_server: FastMCP):
+    """Raw MCP: Cloud/Enterprise backend executes native count_workspace with PQL."""
+    client = MagicMock()
+    client.config.api_root = "https://api.plane.so"
+    cloud_resp = WorkItemCountResponse(
+        total_count=77,
+        grouped_counts={},
+        grouped_by=None,
+        sub_grouped_by=None,
+    )
+    client.work_items.count_workspace.return_value = cloud_resp
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")):
+        async with Client(test_server) as client_mcp:
+            res = await client_mcp.call_tool_mcp(
+                "workitem",
+                {"action": "count", "pql": 'priority = "urgent"'},
+            )
+            assert res.isError is False
+            data = json.loads(res.content[0].text)
+            assert data["total_count"] == 77
+            client.work_items.count_workspace.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_raw_mcp_grouped_count_protocol_semantics(test_server: FastMCP):
+    """Raw MCP: Grouped counts succeed on Cloud and fail explicitly on unverified self-hosted CE."""
+    # 5a: Cloud succeeds natively
+    client_cloud = MagicMock()
+    client_cloud.config.api_root = "https://api.plane.so"
+    grouped_resp = MagicMock()
+    grouped_resp.model_dump.return_value = {
+        "total_count": 50,
+        "grouped_counts": {"backlog": 20, "done": 30},
+        "grouped_by": "state_id",
+        "sub_grouped_by": None,
+    }
+    client_cloud.work_items.count_workspace.return_value = grouped_resp
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client_cloud, "test-ws")):
+        async with Client(test_server) as client_mcp:
+            res = await client_mcp.call_tool_mcp(
+                "workitem",
+                {"action": "count", "group_by": "state_id"},
+            )
+            assert res.isError is False
+            data = json.loads(res.content[0].text)
+            assert data["total_count"] == 50
+            assert data["grouped_counts"] == {"backlog": 20, "done": 30}
+
+    # 5b: Standalone project-scoped grouped count fails closed on unverified CE
+    client_ce = MagicMock()
+    client_ce.config.api_root = "http://ce.internal"
+    with (
+        patch("plane_mcp.tools.workitem.check_pql_capability", None),
+        patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client_ce, "test-ws")),
+    ):
+        async with Client(test_server) as client_mcp:
+            res_ce = await client_mcp.call_tool_mcp(
+                "workitem",
+                {
+                    "action": "count",
+                    "project_id": "00000000-0000-0000-0000-000000000001",
+                    "group_by": "state_id",
+                },
+            )
+            assert res_ce.isError is True
+            assert "Grouped counts are unavailable" in res_ce.content[0].text
+
+
+@pytest.mark.anyio
+async def test_raw_mcp_combined_pr259_pr261_protocol_semantics(test_server: FastMCP):
+    """Raw MCP: Combined #259 + #261 behavior with dynamic capability detection."""
+    client = MagicMock()
+    client.config.api_root = "http://ce.internal"
+
+    # Capability returns False (probe detected unsupported PQL on CE)
+    mock_cap_false = MagicMock(return_value=False)
+    fake_item = WorkItem(
+        id="00000000-0000-0000-0000-000000000002",
+        name="Issue 1",
+        project="00000000-0000-0000-0000-000000000001",
+        workspace="test-ws",
+        sequence_id=1,
+    )
+    client.work_items.list.return_value = PaginatedWorkItemResponse(
+        results=[fake_item],
+        total_count=42,
+        total_results=42,
+        total_pages=1,
+        count=1,
+        next_page_results=False,
+        prev_page_results=False,
+        next_cursor="",
+        prev_cursor="",
+    )
+
+    with (
+        patch("plane_mcp.tools.workitem.check_pql_capability", mock_cap_false),
+        patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")),
+    ):
+        async with Client(test_server) as client_mcp:
+            # Unsupported user PQL count fails closed with isError=true
+            res_pql = await client_mcp.call_tool_mcp(
+                "workitem",
+                {"action": "count", "pql": 'priority = "urgent"'},
+            )
+            assert res_pql.isError is True
+            assert (
+                "Filtered counts are unavailable" in res_pql.content[0].text
+                or "PQL filtering" in res_pql.content[0].text
+            )
+
+            # Direct project-scoped count succeeds safely with isError=false via list fallback
+            res_proj = await client_mcp.call_tool_mcp(
+                "workitem",
+                {"action": "count", "project_id": "00000000-0000-0000-0000-000000000001"},
+            )
+            assert res_proj.isError is False
+            data = json.loads(res_proj.content[0].text)
+            assert data["total_count"] == 42
