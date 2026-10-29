@@ -319,6 +319,17 @@ def register(mcp: FastMCP) -> None:
 
         if action == "count":
             has_user_pql = bool(pql and pql.strip())
+
+            # Standalone safe project count:
+            # Whenever project_id is supplied without user PQL or grouping, do not trust
+            # count_workspace with synthesized project PQL, because CE backends may either
+            # return 404 (absent route) or return HTTP 200 while silently ignoring PQL (which
+            # falsely returns the entire workspace total). Instead, directly read the project's
+            # work-item listing total_count (per_page=1), which is authoritative, exact, natively
+            # scoped by DRF at the SQL level, and supported across all Plane editions.
+            if project_id and not has_user_pql and not (group_by or sub_group_by):
+                return count_fallback(client, workspace_slug, project_id)
+
             scoped = _scoped_pql(pql, project_id)
 
             # Integration with PQL capability detection (e.g. PR #259)
@@ -339,9 +350,6 @@ def register(mcp: FastMCP) -> None:
                             "Grouped counts are unavailable through this Plane public API. "
                             "No fabricated count was returned."
                         )
-                    if not has_user_pql and project_id:
-                        # Project-scoped count can be accurately resolved via project-listing fallback
-                        return count_fallback(client, workspace_slug, project_id)
                     if callable(reject_ce_pql):
                         reject_ce_pql(
                             scoped,

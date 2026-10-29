@@ -346,10 +346,7 @@ async def test_tool_workitem_count_propagates_non_404_error(test_server: FastMCP
             with pytest.raises(ToolError) as exc_info:
                 await client_mcp.call_tool(
                     "workitem",
-                    {
-                        "action": "count",
-                        "project_id": "00000000-0000-0000-0000-000000000001",
-                    },
+                    {"action": "count"},
                 )
             assert "Internal Server Error" in str(exc_info.value)
 
@@ -365,12 +362,25 @@ async def test_tool_workitem_count_propagates_network_failure(test_server: FastM
             with pytest.raises(ToolError) as exc_info:
                 await client_mcp.call_tool(
                     "workitem",
-                    {
-                        "action": "count",
-                        "project_id": "00000000-0000-0000-0000-000000000001",
-                    },
+                    {"action": "count"},
                 )
             assert "Connection refused by host" in str(exc_info.value)
+
+
+@pytest.mark.anyio
+async def test_tool_workitem_count_project_listing_propagates_non_404_error(test_server: FastMCP):
+    """A 500 error on project work-item listing propagates unmasked."""
+    client = MagicMock()
+    client.work_items.list.side_effect = _make_http_error(500, "Internal Server Error")
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")):
+        async with Client(test_server) as client_mcp:
+            with pytest.raises(ToolError) as exc_info:
+                await client_mcp.call_tool(
+                    "workitem",
+                    {"action": "count", "project_id": "00000000-0000-0000-0000-000000000001"},
+                )
+            assert "Internal Server Error" in str(exc_info.value)
 
 
 @pytest.mark.anyio
@@ -610,6 +620,32 @@ async def test_tool_workitem_count_with_pql_capability_rejects_user_pql(test_ser
 
 
 @pytest.mark.anyio
+async def test_tool_workitem_count_standalone_ce_silent_pql_ignore_safe(test_server: FastMCP):
+    """Fake CE server returning 200 with ignored PQL never escapes as project count."""
+    client = MagicMock()
+    # Fake count_workspace returns 9999 (workspace total), silently ignoring PQL
+    client.work_items.count_workspace.return_value = WorkItemCountResponse(
+        total_count=9999,
+        grouped_counts={},
+        grouped_by=None,
+        sub_grouped_by=None,
+    )
+    # Direct project listing returns the true project count 42
+    client.work_items.list.return_value = MagicMock(total_count=42, results=[MagicMock()])
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")):
+        async with Client(test_server) as client_mcp:
+            res = await client_mcp.call_tool(
+                "workitem",
+                {"action": "count", "project_id": "00000000-0000-0000-0000-000000000001"},
+            )
+            assert getattr(res.data, "total_count", None) == 42 or res.data.get("total_count") == 42
+            # count_workspace was not called with synthesized PQL that could return unfiltered totals
+            assert not client.work_items.count_workspace.called
+            client.work_items.list.assert_called_once()
+
+
+@pytest.mark.anyio
 async def test_tool_workitem_count_with_pql_capability_cloud_dispatch(test_server: FastMCP):
     """When PR #259 capability detection confirms PQL is supported, native count_workspace runs."""
     client = MagicMock()
@@ -629,7 +665,11 @@ async def test_tool_workitem_count_with_pql_capability_cloud_dispatch(test_serve
         async with Client(test_server) as client_mcp:
             res = await client_mcp.call_tool(
                 "workitem",
-                {"action": "count", "project_id": "00000000-0000-0000-0000-000000000001"},
+                {
+                    "action": "count",
+                    "project_id": "00000000-0000-0000-0000-000000000001",
+                    "pql": 'priority = "urgent"',
+                },
             )
             assert getattr(res.data, "total_count", None) == 99 or res.data.get("total_count") == 99
             client.work_items.count_workspace.assert_called_once()
