@@ -1,0 +1,392 @@
+"""Deterministic unit tests for self-hosted Plane CE workitem count fallback."""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+from fastmcp import Client, FastMCP
+from fastmcp.exceptions import ToolError
+from plane.errors.errors import HttpError
+from plane.models.work_items import PaginatedWorkItemResponse, WorkItem
+
+from plane_mcp.ce_count import MAX_PAGES, MAX_PROJECTS, count_fallback
+from plane_mcp.tools.workitem import register
+
+
+def _make_http_error(status: int = 404, message: str = "Not Found") -> HttpError:
+    return HttpError(message, status_code=status, response={"error": message})
+
+
+@pytest.fixture
+def test_server():
+    """FastMCP test server instance registering workitem tool."""
+    server = FastMCP("test-server")
+    register(server)
+    return server
+
+
+# ============================================================================
+# Unit Tests for count_fallback core logic
+# ============================================================================
+
+
+def test_count_fallback_single_project():
+    """Project-scoped count returns exact total_count from single project listing."""
+    client = MagicMock()
+    page = PaginatedWorkItemResponse(
+        results=[
+            WorkItem(id="w1", name="Item 1", priority="urgent", sequence_id=1),
+            WorkItem(id="w2", name="Item 2", priority="high", sequence_id=2),
+        ],
+        total_count=42,
+        total_results=42,
+        total_pages=21,
+        count=2,
+        next_page_results=True,
+        prev_page_results=False,
+        next_cursor="c2",
+        prev_cursor="",
+    )
+    client.work_items.list.return_value = page
+
+    res = count_fallback(client, "test-ws", "proj-1")
+    assert res["total_count"] == 42
+    assert res["grouped_counts"] == {}
+    assert res["grouped_by"] is None
+    assert res["sub_grouped_by"] is None
+    client.work_items.list.assert_called_once()
+
+
+def test_count_fallback_project_empty():
+    """Project with 0 items returns exact total_count=0."""
+    client = MagicMock()
+    page = PaginatedWorkItemResponse(
+        results=[],
+        total_count=0,
+        total_results=0,
+        total_pages=0,
+        count=0,
+        next_page_results=False,
+        prev_page_results=False,
+        next_cursor="",
+        prev_cursor="",
+    )
+    client.work_items.list.return_value = page
+
+    res = count_fallback(client, "test-ws", "proj-empty")
+    assert res["total_count"] == 0
+    assert res["grouped_counts"] == {}
+
+
+def test_count_fallback_workspace_multiple_projects():
+    """Workspace count sums active projects and excludes archived projects."""
+    client = MagicMock()
+    p1 = MagicMock(id="p1", archived_at=None)
+    p2 = MagicMock(id="p2", archived_at=None)
+    p_archived = MagicMock(id="p3", archived_at="2026-01-01T00:00:00Z")
+
+    client.projects.list.return_value = MagicMock(results=[p1, p2, p_archived], next_page_results=False)
+
+    def list_items(workspace_slug, project_id, params):
+        if project_id == "p1":
+            return MagicMock(total_count=15, results=[MagicMock()])
+        if project_id == "p2":
+            return MagicMock(total_count=25, results=[MagicMock()])
+        raise AssertionError(f"Unexpected project_id: {project_id}")
+
+    client.work_items.list.side_effect = list_items
+
+    res = count_fallback(client, "test-ws")
+    assert res["total_count"] == 40
+    assert res["grouped_counts"] == {}
+    assert res["grouped_by"] is None
+    assert res["sub_grouped_by"] is None
+
+
+def test_count_fallback_workspace_empty():
+    """Workspace with 0 projects returns total_count=0."""
+    client = MagicMock()
+    client.projects.list.return_value = MagicMock(results=[], next_page_results=False)
+
+    res = count_fallback(client, "test-ws")
+    assert res["total_count"] == 0
+    assert res["grouped_counts"] == {}
+
+
+def test_count_fallback_workspace_pagination_continuation():
+    """Workspace project listing traverses multiple pages using next_cursor."""
+    client = MagicMock()
+    p1 = MagicMock(id="p1", archived_at=None)
+    p2 = MagicMock(id="p2", archived_at=None)
+
+    page1 = MagicMock(results=[p1], next_page_results=True, next_cursor="cur-2")
+    page2 = MagicMock(results=[p2], next_page_results=False, next_cursor=None)
+
+    client.projects.list.side_effect = [page1, page2]
+
+    def list_items(workspace_slug, project_id, params):
+        if project_id == "p1":
+            return MagicMock(total_count=10, results=[MagicMock()])
+        if project_id == "p2":
+            return MagicMock(total_count=20, results=[MagicMock()])
+        raise AssertionError(f"Unexpected project_id: {project_id}")
+
+    client.work_items.list.side_effect = list_items
+
+    res = count_fallback(client, "test-ws")
+    assert res["total_count"] == 30
+    assert client.projects.list.call_count == 2
+
+
+def test_count_fallback_raises_tool_error_on_inaccessible_projects():
+    """Inaccessible projects (401/403) must raise ToolError, never returning misleading partial counts."""
+    client = MagicMock()
+    p1 = MagicMock(id="p1", archived_at=None)
+    p2_forbidden = MagicMock(id="p2", archived_at=None)
+
+    client.projects.list.return_value = MagicMock(results=[p1, p2_forbidden], next_page_results=False)
+
+    def list_items(workspace_slug, project_id, params):
+        if project_id == "p1":
+            return MagicMock(total_count=10, results=[MagicMock()])
+        raise _make_http_error(status=403, message="Forbidden project")
+
+    client.work_items.list.side_effect = list_items
+
+    with pytest.raises(ToolError) as exc_info:
+        count_fallback(client, "test-ws")
+
+    err = str(exc_info.value)
+    assert "cannot be accurately determined" in err
+    assert "p2" in err
+    assert "specify an accessible project_id" in err
+
+
+def test_count_fallback_project_non_existent_propagates_404():
+    """Calling count_fallback on a non-existent project_id propagates HttpError(404)."""
+    client = MagicMock()
+    client.work_items.list.side_effect = _make_http_error(404, "Project not found.")
+
+    with pytest.raises(HttpError) as exc_info:
+        count_fallback(client, "test-ws", "missing-proj")
+
+    assert exc_info.value.status_code == 404
+
+
+def test_count_fallback_rejects_contradictory_total_count():
+    """If results list exceeds declared total_count, ToolError is raised."""
+    client = MagicMock()
+    client.work_items.list.return_value = MagicMock(total_count=1, results=[MagicMock(), MagicMock()])
+
+    with pytest.raises(ToolError) as exc_info:
+        count_fallback(client, "test-ws", "proj-1")
+
+    assert "contradicts total_count" in str(exc_info.value)
+
+
+def test_count_fallback_rejects_invalid_total_count_type():
+    """Non-integer, boolean, or negative total_count raises ToolError."""
+    client = MagicMock()
+    client.work_items.list.return_value = MagicMock(total_count=True, results=[])
+
+    with pytest.raises(ToolError) as exc_info:
+        count_fallback(client, "test-ws", "proj-1")
+
+    assert "no trustworthy total_count" in str(exc_info.value)
+
+
+def test_count_fallback_rejects_exceeded_project_limit():
+    """Workspaces with more than MAX_PROJECTS projects raise ToolError."""
+    client = MagicMock()
+    # 101 distinct projects on one page
+    projects = [MagicMock(id=f"proj-{i}", archived_at=None) for i in range(MAX_PROJECTS + 1)]
+    client.projects.list.return_value = MagicMock(results=projects, next_page_results=False)
+
+    with pytest.raises(ToolError) as exc_info:
+        count_fallback(client, "test-ws")
+
+    assert "project scan limit" in str(exc_info.value)
+
+
+def test_count_fallback_rejects_exceeded_page_limit():
+    """Pagination that continues beyond MAX_PAGES raises ToolError."""
+    client = MagicMock()
+    pages = []
+    for i in range(MAX_PAGES + 1):
+        p = MagicMock(id=f"p-{i}", archived_at=None)
+        pages.append(MagicMock(results=[p], next_page_results=True, next_cursor=f"cur-{i + 1}"))
+    client.projects.list.side_effect = pages
+
+    with pytest.raises(ToolError) as exc_info:
+        count_fallback(client, "test-ws")
+
+    assert "page scan limit" in str(exc_info.value)
+
+
+def test_count_fallback_rejects_stalled_cursor():
+    """Stalling cursor (repeated cursor) raises ToolError."""
+    client = MagicMock()
+    p1 = MagicMock(id="p1", archived_at=None)
+    page1 = MagicMock(results=[p1], next_page_results=True, next_cursor="cur-same")
+    page2 = MagicMock(results=[p1], next_page_results=True, next_cursor="cur-same")
+    client.projects.list.side_effect = [page1, page2]
+
+    with pytest.raises(ToolError) as exc_info:
+        count_fallback(client, "test-ws")
+
+    # Will catch duplicate project ID or stalling cursor
+    assert "repeated" in str(exc_info.value) or "stalled" in str(exc_info.value)
+
+
+def test_count_fallback_rejects_malformed_project_page():
+    """Malformed project response missing required attributes raises ToolError."""
+    client = MagicMock()
+    client.projects.list.return_value = object()  # Lacks results / next_page_results
+
+    with pytest.raises(ToolError) as exc_info:
+        count_fallback(client, "test-ws")
+
+    assert "valid paginated response" in str(exc_info.value)
+
+
+# ============================================================================
+# Tool Integration Tests via FastMCP Client
+# ============================================================================
+
+
+@pytest.mark.anyio
+async def test_tool_workitem_count_falls_back_on_404(test_server: FastMCP):
+    """Calling workitem(action='count') triggers count_fallback when count_workspace 404s."""
+    client = MagicMock()
+    client.work_items.count_workspace.side_effect = _make_http_error(404, "Page not found.")
+
+    p1 = MagicMock(id="p1", archived_at=None)
+    client.projects.list.return_value = MagicMock(results=[p1], next_page_results=False)
+    client.work_items.list.return_value = MagicMock(total_count=18, results=[MagicMock()])
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")):
+        async with Client(test_server) as client_mcp:
+            res = await client_mcp.call_tool("workitem", {"action": "count"})
+            assert getattr(res.data, "total_count", None) == 18 or res.data.get("total_count") == 18
+
+
+@pytest.mark.anyio
+async def test_tool_workitem_count_project_scoped_on_404(test_server: FastMCP):
+    """Calling workitem(action='count', project_id=...) falls back to exact project count."""
+    client = MagicMock()
+    client.work_items.count_workspace.side_effect = _make_http_error(404, "Page not found.")
+    client.work_items.list.return_value = MagicMock(total_count=77, results=[MagicMock()])
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")):
+        async with Client(test_server) as client_mcp:
+            res = await client_mcp.call_tool(
+                "workitem",
+                {"action": "count", "project_id": "00000000-0000-0000-0000-000000000001"},
+            )
+            assert getattr(res.data, "total_count", None) == 77 or res.data.get("total_count") == 77
+            client.work_items.list.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_tool_workitem_count_rejects_grouped_counts_on_404(test_server: FastMCP):
+    """When count_workspace 404s, requesting group_by raises ToolError instead of returning fake counts."""
+    client = MagicMock()
+    client.work_items.count_workspace.side_effect = _make_http_error(404, "Page not found.")
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")):
+        async with Client(test_server) as client_mcp:
+            with pytest.raises(ToolError) as exc_info:
+                await client_mcp.call_tool(
+                    "workitem",
+                    {
+                        "action": "count",
+                        "project_id": "00000000-0000-0000-0000-000000000001",
+                        "group_by": "state_id",
+                    },
+                )
+            assert "Grouped counts are unavailable" in str(exc_info.value)
+
+
+@pytest.mark.anyio
+async def test_tool_workitem_count_rejects_filtered_counts_on_404(test_server: FastMCP):
+    """When count_workspace 404s, passing user pql raises ToolError instead of returning unfiltered totals."""
+    client = MagicMock()
+    client.work_items.count_workspace.side_effect = _make_http_error(404, "Page not found.")
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")):
+        async with Client(test_server) as client_mcp:
+            with pytest.raises(ToolError) as exc_info:
+                await client_mcp.call_tool(
+                    "workitem",
+                    {
+                        "action": "count",
+                        "project_id": "00000000-0000-0000-0000-000000000001",
+                        "pql": 'priority = "urgent"',
+                    },
+                )
+            assert "Filtered counts are unavailable" in str(exc_info.value)
+
+
+@pytest.mark.anyio
+async def test_tool_workitem_count_propagates_non_404_error(test_server: FastMCP):
+    """A 500 server error on count_workspace is not masked by the 404 fallback."""
+    client = MagicMock()
+    client.work_items.count_workspace.side_effect = _make_http_error(500, "Internal Server Error")
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")):
+        async with Client(test_server) as client_mcp:
+            with pytest.raises(ToolError) as exc_info:
+                await client_mcp.call_tool(
+                    "workitem",
+                    {
+                        "action": "count",
+                        "project_id": "00000000-0000-0000-0000-000000000001",
+                    },
+                )
+            assert "Internal Server Error" in str(exc_info.value)
+
+
+@pytest.mark.anyio
+async def test_tool_workitem_count_propagates_network_failure(test_server: FastMCP):
+    """Network connection errors on count_workspace propagate unmasked."""
+    client = MagicMock()
+    client.work_items.count_workspace.side_effect = ConnectionError("Connection refused by host")
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")):
+        async with Client(test_server) as client_mcp:
+            with pytest.raises(ToolError) as exc_info:
+                await client_mcp.call_tool(
+                    "workitem",
+                    {
+                        "action": "count",
+                        "project_id": "00000000-0000-0000-0000-000000000001",
+                    },
+                )
+            assert "Connection refused by host" in str(exc_info.value)
+
+
+@pytest.mark.anyio
+async def test_tool_workitem_count_inaccessible_projects_raises_tool_error(test_server: FastMCP):
+    """When a workspace project is 403 forbidden during fallback, FastMCP raises ToolError."""
+    client = MagicMock()
+    client.work_items.count_workspace.side_effect = _make_http_error(404, "Page not found.")
+
+    p1 = MagicMock(id="p1", archived_at=None)
+    p2 = MagicMock(id="p2-secret", archived_at=None)
+    client.projects.list.return_value = MagicMock(results=[p1, p2], next_page_results=False)
+
+    def list_items(workspace_slug, project_id, params):
+        if project_id == "p1":
+            return MagicMock(total_count=5, results=[MagicMock()])
+        raise _make_http_error(status=403, message="Forbidden project")
+
+    client.work_items.list.side_effect = list_items
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")):
+        async with Client(test_server) as client_mcp:
+            with pytest.raises(ToolError) as exc_info:
+                await client_mcp.call_tool("workitem", {"action": "count"})
+            err = str(exc_info.value)
+            assert "cannot be accurately determined" in err
+            assert "p2-secret" in err

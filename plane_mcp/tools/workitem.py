@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal, get_args
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from fastmcp.utilities.logging import get_logger
 from plane.errors.errors import HttpError
 from plane.models.enums import PriorityEnum
@@ -28,6 +29,7 @@ from plane.models.work_items import (
 )
 from pydantic import Field
 
+from plane_mcp.ce_count import count_fallback
 from plane_mcp.client import get_plane_client_context
 from plane_mcp.pql_reference import PQL_FIELD_HINT
 from plane_mcp.toolkit import (
@@ -322,7 +324,19 @@ def register(mcp: FastMCP) -> None:
                 failure = pql_failure("workitem", action, scoped, exc)
                 if failure:
                     return failure
-                raise
+                if exc.status_code != 404:
+                    raise
+                if group_by or sub_group_by:
+                    raise ToolError(
+                        "Grouped counts are unavailable through this Plane public API. "
+                        "No fabricated count was returned."
+                    ) from exc
+                if pql and pql.strip():
+                    raise ToolError(
+                        "Filtered counts are unavailable when this Plane server's count endpoint is missing. "
+                        "No fabricated count was returned."
+                    ) from exc
+                return count_fallback(client, workspace_slug, project_id)
             return response.model_dump()
 
         if action == "search":
