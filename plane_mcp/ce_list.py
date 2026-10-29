@@ -22,6 +22,7 @@ _MAX_PROJECTS = 1_000
 _MAX_MEMBERS = 10_000
 _MAX_PAGES = 10
 _BACKEND_PAGE_SIZE = 100
+_MAX_CURSOR_OFFSET_DIGITS = 10
 _PROJECT_LITE_FIELDS = set(ProjectLite.model_fields.keys())
 
 
@@ -62,7 +63,14 @@ def _ce_page(items: list[Any], *, cursor: str, per_page: int, model: type):
     if not cursor_str:
         offset = 0
     elif cursor_str.startswith("ce:") and cursor_str[3:].isascii() and cursor_str[3:].isdigit():
-        offset = int(cursor_str[3:])
+        digits = cursor_str[3:]
+        if len(digits) > _MAX_CURSOR_OFFSET_DIGITS:
+            safe_cursor = f"'{cursor_str[:32]}...'" if len(cursor_str) > 32 else f"'{cursor_str}'"
+            raise ToolError(
+                f"Invalid CE pagination cursor: {safe_cursor}. "
+                f"Offset exceeds maximum supported digits ({_MAX_CURSOR_OFFSET_DIGITS})."
+            )
+        offset = int(digits)
     else:
         safe_cursor = f"'{cursor_str[:32]}...'" if len(cursor_str) > 32 else (f"'{cursor_str}'" if cursor_str else "''")
         raise ToolError(f"Invalid CE pagination cursor: {safe_cursor}. Expected empty string or 'ce:<offset>'.")
@@ -190,7 +198,14 @@ def list_workspace_members_ce(
     for field, value in text_filters.items():
         if value:
             needle = value.casefold()
-            members = [m for m in members if needle in str(_get_field(m, field, "")).casefold()]
+            filtered_text: list[Any] = []
+            for m in members:
+                present, val = _field_presence_and_value(m, field)
+                if not present:
+                    raise ToolError(f"CE cannot reliably filter by {field}: API field unavailable on records.")
+                if val is not None and needle in str(val).casefold():
+                    filtered_text.append(m)
+            members = filtered_text
 
     exact_filters = (
         ("role_slug", role_slug),

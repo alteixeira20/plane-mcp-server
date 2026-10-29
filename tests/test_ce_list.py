@@ -226,6 +226,44 @@ def test_ce_page_cursor_truncation_security():
     assert len(msg) < 150
 
 
+def test_ce_page_cursor_numeric_limits():
+    """Verify numeric cursor offset limits, leading zeros, and oversized inputs."""
+    items = [
+        {"id": "p1", "name": "P1", "identifier": "P1"},
+        {"id": "p2", "name": "P2", "identifier": "P2"},
+    ]
+
+    # 1. Valid cursor
+    res_valid = _ce_page(items, cursor="ce:1", per_page=10, model=PaginatedProjectLiteResponse)
+    assert len(res_valid.results) == 1
+    assert res_valid.results[0].id == "p2"
+
+    # 2. Leading zeros
+    res_lz = _ce_page(items, cursor="ce:001", per_page=10, model=PaginatedProjectLiteResponse)
+    assert len(res_lz.results) == 1
+    assert res_lz.results[0].id == "p2"
+
+    # 3. Invalid negative offset
+    with pytest.raises(ToolError, match="Invalid CE pagination cursor"):
+        _ce_page(items, cursor="ce:-1", per_page=10, model=PaginatedProjectLiteResponse)
+
+    # 4. Valid but out-of-range offset within digit limit
+    with pytest.raises(ToolError, match="out of range for total 2 items"):
+        _ce_page(items, cursor="ce:99999", per_page=10, model=PaginatedProjectLiteResponse)
+
+    # 5. Oversized decimal cursor (>10 digits)
+    with pytest.raises(ToolError, match="Offset exceeds maximum supported digits"):
+        _ce_page(items, cursor="ce:12345678901", per_page=10, model=PaginatedProjectLiteResponse)
+
+    # 6. More than 4,300 digits (safely rejected with ToolError without triggering ValueError)
+    huge_cursor = "ce:" + "9" * 5000
+    with pytest.raises(ToolError) as exc_info:
+        _ce_page(items, cursor=huge_cursor, per_page=10, model=PaginatedProjectLiteResponse)
+    assert "Offset exceeds maximum supported digits" in str(exc_info.value)
+    assert "..." in str(exc_info.value)
+    assert len(str(exc_info.value)) < 150
+
+
 # ============================================================================
 # Unit Tests for list_projects_ce
 # ============================================================================
@@ -523,6 +561,86 @@ def test_list_workspace_members_ce_nullable_and_missing_field_matrix():
     assert res_empty.results == []
 
 
+def test_list_workspace_members_ce_text_filters_presence_and_matrix():
+    """Verify presence checking, omitted field fail-closed, null handling, and matches across all 4 text filters."""
+    client = MagicMock()
+    text_fields = ["first_name", "last_name", "email", "display_name"]
+
+    # 1. Omitted Pydantic field: fails closed with ToolError for all 4 text fields
+    m_omitted = WorkspaceMember(id="m_omit")
+    client.workspaces.get_members.return_value = [m_omitted]
+    for field in text_fields:
+        with pytest.raises(ToolError, match=f"cannot reliably filter by {field}"):
+            list_workspace_members_ce(client, "test-ws", **{field: "test"})
+
+    # 2. Missing dictionary key: fails closed with ToolError for all 4 text fields
+    client.workspaces.get_members.return_value = [{"id": "d1"}]
+    for field in text_fields:
+        with pytest.raises(ToolError, match=f"cannot reliably filter by {field}"):
+            list_workspace_members_ce(client, "test-ws", **{field: "test"})
+
+    # 3. Explicit None: non-matching, does not raise error
+    m_null = WorkspaceMember.model_validate(
+        {
+            "id": "m_null",
+            "first_name": None,
+            "last_name": None,
+            "email": None,
+            "display_name": None,
+        }
+    )
+    m_target = WorkspaceMember.model_validate(
+        {
+            "id": "m_target",
+            "first_name": "Alice",
+            "last_name": "Smith",
+            "email": "alice@example.com",
+            "display_name": "AliceS",
+        }
+    )
+    client.workspaces.get_members.return_value = [m_null, m_target]
+    for field, needle in [
+        ("first_name", "alice"),
+        ("last_name", "smith"),
+        ("email", "example.com"),
+        ("display_name", "alices"),
+    ]:
+        res = list_workspace_members_ce(client, "test-ws", **{field: needle})
+        assert [m.id for m in res.results] == ["m_target"]
+
+    # Explicit None records queried with a non-matching string yield empty results cleanly
+    res_none = list_workspace_members_ce(client, "test-ws", first_name="nonexistent")
+    assert res_none.results == []
+
+    # 4. Mixed records (one present, one omitted): fails closed with ToolError
+    client.workspaces.get_members.return_value = [m_target, m_omitted]
+    for field in text_fields:
+        with pytest.raises(ToolError, match=f"cannot reliably filter by {field}"):
+            list_workspace_members_ce(client, "test-ws", **{field: "test"})
+
+    # 5. Unicode case folding & substring matching
+    m_unicode = WorkspaceMember.model_validate(
+        {
+            "id": "m_uni",
+            "first_name": "STRAßE",
+            "last_name": "MÜLLER",
+            "email": "USER@DOMAIN.COM",
+            "display_name": "ÉLÈVE",
+        }
+    )
+    client.workspaces.get_members.return_value = [m_unicode]
+    assert len(list_workspace_members_ce(client, "test-ws", first_name="straße").results) == 1
+    assert len(list_workspace_members_ce(client, "test-ws", last_name="müller").results) == 1
+    assert len(list_workspace_members_ce(client, "test-ws", email="user@domain").results) == 1
+    assert len(list_workspace_members_ce(client, "test-ws", display_name="élève").results) == 1
+
+    # 6. Empty collection returns empty list without error
+    client.workspaces.get_members.return_value = []
+    for field in text_fields:
+        res_empty = list_workspace_members_ce(client, "test-ws", **{field: "test"})
+        assert res_empty.results == []
+
+
 def test_list_workspace_members_ce_descending_sort_stability():
     """Verify null-last placement and deterministic tie-breaking in ASC and DESC (CE-AUDIT-004)."""
     client = MagicMock()
@@ -793,3 +911,41 @@ async def test_raw_mcp_is_error_member_unavailable_filter_field(member_server: F
             res = await mcp_client.call_tool_mcp("member", {"action": "list_workspace", "is_active": True})
             assert res.isError is True
             assert "cannot reliably filter by is_active" in res.content[0].text
+
+
+@pytest.mark.anyio
+async def test_raw_mcp_is_error_member_unavailable_text_filter_field(member_server: FastMCP):
+    """Verify raw MCP isError=true when member text filter fields are omitted from records."""
+    client = MagicMock()
+    client.workspaces.get_members_lite.side_effect = _make_http_error(404, "Page not found.")
+    # Member with omitted email and display_name
+    client.workspaces.get_members.return_value = [WorkspaceMember(id="m1", first_name="Alice")]
+
+    with patch("plane_mcp.tools.member.get_plane_client_context", return_value=(client, "test-ws")):
+        async with Client(member_server) as mcp_client:
+            for field in ("email", "last_name", "display_name"):
+                res = await mcp_client.call_tool_mcp("member", {"action": "list_workspace", field: "query"})
+                assert res.isError is True
+                assert f"cannot reliably filter by {field}" in res.content[0].text
+
+
+@pytest.mark.anyio
+async def test_raw_mcp_is_error_project_oversized_numeric_cursor(project_server: FastMCP):
+    """Verify raw MCP isError=true for oversized and >4,300 digit cursor offsets."""
+    client = MagicMock()
+    client.projects.list_lite.side_effect = _make_http_error(404, "Page not found.")
+    client.projects.list.return_value = _make_project_page(
+        [Project(id="p1", name="P1", identifier="P1", archived_at=None)]
+    )
+
+    with patch("plane_mcp.tools.project.get_plane_client_context", return_value=(client, "test-ws")):
+        async with Client(project_server) as mcp_client:
+            # 1. 11-digit cursor
+            res1 = await mcp_client.call_tool_mcp("project", {"action": "list", "cursor": "ce:12345678901"})
+            assert res1.isError is True
+            assert "Offset exceeds maximum supported digits" in res1.content[0].text
+
+            # 2. >4,300 digit cursor
+            res2 = await mcp_client.call_tool_mcp("project", {"action": "list", "cursor": "ce:" + "9" * 5000})
+            assert res2.isError is True
+            assert "Offset exceeds maximum supported digits" in res2.content[0].text
