@@ -148,6 +148,8 @@ def test_missing_required_params_are_reported(mod, action, registered, spy):
     try:
         result = tool.fn(**args)
     except ToolError as exc:
+        if action.name != "list":
+            raise
         result = str(exc)
 
     assert isinstance(result, str) and result.startswith("Error:"), (
