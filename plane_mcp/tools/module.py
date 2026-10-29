@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from plane.errors import HttpError
 from plane.models.modules import (
     CreateModule,
@@ -138,6 +139,8 @@ def register(mcp: FastMCP) -> None:
         client, workspace_slug = get_plane_client_context()
 
         if not project_id:
+            if action == "list":
+                raise ToolError(missing(action, "project_id"))
             return missing(action, "project_id")
 
         if error := one_of("status", status, STATUSES):
@@ -163,6 +166,7 @@ def register(mcp: FastMCP) -> None:
                     cursor=cursor,
                     per_page=per_page or 100,
                     order_by=order_by,
+                    status=status,
                 )
 
         if action == "create":

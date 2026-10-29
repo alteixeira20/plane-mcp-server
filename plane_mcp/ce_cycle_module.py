@@ -9,6 +9,7 @@ and field trimming conforming to the *Lite models.
 
 from __future__ import annotations
 
+import uuid
 from math import ceil
 from typing import Any
 
@@ -32,6 +33,48 @@ def _get_field(obj: Any, field: str, default: Any = None) -> Any:
     else:
         val = getattr(obj, field, default)
     return default if val is None else val
+
+
+def _is_uuid(val: Any) -> bool:
+    """Determine whether a string is a valid UUID."""
+    try:
+        uuid.UUID(str(val))
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+def _validate_scope(
+    item: Any,
+    *,
+    requested_project: str,
+    workspace_slug: str,
+    resource_name: str,
+) -> tuple[str, str]:
+    """Validate project and workspace scoping, preventing cross-project scope leakage.
+
+    Returns (effective_project, effective_workspace).
+    """
+    rec_project = _get_field(item, "project")
+    if rec_project:
+        if str(rec_project) != str(requested_project):
+            raise ToolError(f"CE {resource_name} record does not match the requested project scope.")
+        effective_project = str(rec_project)
+    else:
+        # Standard endpoint is strictly project-scoped (/projects/{project_id}/...)
+        effective_project = requested_project
+
+    rec_workspace = _get_field(item, "workspace")
+    if rec_workspace:
+        rec_ws_str = str(rec_workspace)
+        if rec_ws_str == str(workspace_slug) or _is_uuid(rec_ws_str):
+            effective_workspace = rec_ws_str
+        else:
+            raise ToolError(f"CE {resource_name} record does not match the requested workspace scope.")
+    else:
+        effective_workspace = workspace_slug
+
+    return effective_project, effective_workspace
 
 
 def _ce_page(items: list[Any], *, cursor: str, per_page: int, model: type):
@@ -131,6 +174,15 @@ def _ce_collect_standard(
                 raise ToolError(f"CE {resource_name} listing exceeds maximum safety limit of {_MAX_ITEMS} items.")
 
         if not getattr(page, "next_page_results", False):
+            backend_total = getattr(page, "total_count", None)
+            if backend_total is None:
+                backend_total = getattr(page, "total_results", None)
+            if backend_total is not None and isinstance(backend_total, int):
+                if backend_total != len(items):
+                    raise ToolError(
+                        f"CE standard {resource_name} listing incomplete: backend reported "
+                        f"total={backend_total} but only {len(items)} items were collected."
+                    )
             return items
 
         following = getattr(page, "next_cursor", None)
@@ -184,12 +236,20 @@ def list_cycles_ce(
             if hasattr(c, "model_dump")
             else {k: v for k, v in c.items() if k in _CYCLE_LITE_FIELDS}
         )
-        if not row.get("workspace"):
-            row["workspace"] = workspace_slug
-        if not row.get("project"):
-            row["project"] = project_id
-        if row.get("owned_by") is None:
-            row["owned_by"] = ""
+        eff_proj, eff_ws = _validate_scope(
+            c,
+            requested_project=project_id,
+            workspace_slug=workspace_slug,
+            resource_name="cycle",
+        )
+        row["project"] = eff_proj
+        row["workspace"] = eff_ws
+
+        owner = _get_field(c, "owned_by")
+        if not owner:
+            item_id = _get_field(c, "id", "")
+            raise ToolError(f"CE cycle record '{item_id}' missing required 'owned_by' attribute.")
+        row["owned_by"] = str(owner)
         rows.append(row)
     return _ce_page(
         rows,
@@ -207,13 +267,19 @@ def list_modules_ce(
     cursor: str = "",
     per_page: int = 100,
     order_by: str = "",
+    status: str = "",
 ) -> PaginatedModuleLiteResponse:
     """Use standard modules API, exclude archived records, and paginate honestly.
 
-    Fails closed if unsupported order_by filter is requested.
+    Fails closed if unsupported status or order_by filters are requested.
     """
     if not 1 <= per_page <= 1000:
         raise ToolError(f"CE per_page must be in the range 1..1000, got {per_page}.")
+    if status:
+        raise ToolError(
+            f"Filtering by status='{status}' is not supported on this Plane CE module fallback endpoint. "
+            "Please retry without status."
+        )
     if order_by:
         raise ToolError(
             f"Sorting by '{order_by}' is not supported on this Plane CE module fallback endpoint. "
@@ -235,10 +301,14 @@ def list_modules_ce(
             if hasattr(m, "model_dump")
             else {k: v for k, v in m.items() if k in _MODULE_LITE_FIELDS}
         )
-        if not row.get("workspace"):
-            row["workspace"] = workspace_slug
-        if not row.get("project"):
-            row["project"] = project_id
+        eff_proj, eff_ws = _validate_scope(
+            m,
+            requested_project=project_id,
+            workspace_slug=workspace_slug,
+            resource_name="module",
+        )
+        row["project"] = eff_proj
+        row["workspace"] = eff_ws
         rows.append(row)
     return _ce_page(
         rows,

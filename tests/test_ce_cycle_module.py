@@ -384,12 +384,20 @@ async def test_network_failure_propagates_without_fallback(test_server, mock_cli
 
 @pytest.mark.anyio
 async def test_missing_project_id_returns_error(test_server, mock_client):
-    """Missing project_id returns missing parameter error before any network request."""
+    """Missing project_id on list returns genuine FastMCP ToolError (isError=True) before any network request."""
     with patch("plane_mcp.tools.cycle.get_plane_client_context", return_value=(mock_client, WORKSPACE_SLUG)):
         async with Client(test_server) as client:
-            res = await client.call_tool("cycle", {"action": "list", "project_id": ""})
-            assert "project_id" in str(res)
+            res_cycle = await client.call_tool_mcp("cycle", {"action": "list", "project_id": ""})
+            assert res_cycle.isError is True
+            assert "project_id" in res_cycle.content[0].text
             assert mock_client.cycles.list_lite.call_count == 0
+
+    with patch("plane_mcp.tools.module.get_plane_client_context", return_value=(mock_client, WORKSPACE_SLUG)):
+        async with Client(test_server) as client:
+            res_module = await client.call_tool_mcp("module", {"action": "list", "project_id": ""})
+            assert res_module.isError is True
+            assert "project_id" in res_module.content[0].text
+            assert mock_client.modules.list_lite.call_count == 0
 
 
 # ==============================================================================
@@ -604,7 +612,7 @@ def test_module_archived_records_filtered(mock_client):
         workspace=WORKSPACE_SLUG,
         archived_at="2026-01-01T00:00:00Z",
     )
-    mock_client.modules.list.return_value = [m1_active, m2_archived]
+    mock_client.modules.list.return_value = make_module_standard_page([m1_active, m2_archived])
 
     res = list_modules_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
     assert res.total_count == 1
@@ -643,12 +651,96 @@ def test_missing_optional_fields_handled_cleanly(mock_client):
 
 def test_missing_id_raises_tool_error(mock_client):
     """A record with missing or empty ID raises ToolError."""
-    bad_record = {"name": "No ID Cycle", "project": PROJECT_ID}
+    bad_record = {"name": "No ID Cycle", "project": PROJECT_ID, "owned_by": OWNER_ID}
     mock_client.cycles.list.return_value = [bad_record]
 
     with pytest.raises(ToolError) as exc_info:
         list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
     assert "missing required 'id' attribute" in str(exc_info.value)
+
+
+def test_missing_or_null_owner_raises_tool_error(mock_client):
+    """Cycle with null, empty, or omitted owned_by raises ToolError without fabricating owner IDs."""
+    c_none = Cycle(id="c_none", name="Null Owner", project=PROJECT_ID, workspace=WORKSPACE_SLUG, owned_by=None)
+    mock_client.cycles.list.return_value = [c_none]
+    with pytest.raises(ToolError) as exc_none:
+        list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
+    assert "missing required 'owned_by' attribute" in str(exc_none.value)
+
+    c_empty = Cycle(id="c_empty", name="Empty Owner", project=PROJECT_ID, workspace=WORKSPACE_SLUG, owned_by="")
+    mock_client.cycles.list.return_value = [c_empty]
+    with pytest.raises(ToolError) as exc_empty:
+        list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
+    assert "missing required 'owned_by' attribute" in str(exc_empty.value)
+
+    dict_omitted = {"id": "c_omitted", "name": "Omitted Owner", "project": PROJECT_ID, "workspace": WORKSPACE_SLUG}
+    mock_client.cycles.list.return_value = [dict_omitted]
+    with pytest.raises(ToolError) as exc_omitted:
+        list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
+    assert "missing required 'owned_by' attribute" in str(exc_omitted.value)
+
+
+def test_valid_owner_is_preserved_authentically(mock_client):
+    """Authentic owner identifiers are preserved accurately."""
+    c = Cycle(id="c1", name="Owner Cycle", project=PROJECT_ID, workspace=WORKSPACE_SLUG, owned_by="usr-authentic-42")
+    mock_client.cycles.list.return_value = [c]
+    res = list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
+    assert res.results[0].owned_by == "usr-authentic-42"
+
+
+def test_mismatched_project_scope_raises_tool_error(mock_client):
+    """Records with mismatched project identifiers raise ToolError to prevent scope leakage."""
+    c_foreign = Cycle(
+        id="c_foreign", name="Foreign Cycle", project="other-project", workspace=WORKSPACE_SLUG, owned_by=OWNER_ID
+    )
+    mock_client.cycles.list.return_value = [c_foreign]
+    with pytest.raises(ToolError) as exc_cycle:
+        list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
+    assert "does not match the requested project scope" in str(exc_cycle.value)
+
+    m_foreign = Module(id="m_foreign", name="Foreign Module", project="other-project", workspace=WORKSPACE_SLUG)
+    mock_client.modules.list.return_value = make_module_standard_page([m_foreign])
+    with pytest.raises(ToolError) as exc_module:
+        list_modules_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
+    assert "does not match the requested project scope" in str(exc_module.value)
+
+
+def test_workspace_scope_validation(mock_client):
+    """Workspace representation supports exact slug and UUIDs, rejecting foreign slugs."""
+    # Valid matching slug
+    c1 = Cycle(id="c1", name="C1", project=PROJECT_ID, workspace=WORKSPACE_SLUG, owned_by=OWNER_ID)
+    mock_client.cycles.list.return_value = [c1]
+    res1 = list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
+    assert res1.results[0].workspace == WORKSPACE_SLUG
+
+    # Valid UUID representation
+    ws_uuid = "41e3ed60-d8b8-42f9-b7b3-0c888bfce2cb"
+    c2 = Cycle(id="c2", name="C2", project=PROJECT_ID, workspace=ws_uuid, owned_by=OWNER_ID)
+    mock_client.cycles.list.return_value = [c2]
+    res2 = list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
+    assert res2.results[0].workspace == ws_uuid
+
+    # Foreign workspace slug
+    c3 = Cycle(id="c3", name="C3", project=PROJECT_ID, workspace="foreign-org-slug", owned_by=OWNER_ID)
+    mock_client.cycles.list.return_value = [c3]
+    with pytest.raises(ToolError) as exc_ws:
+        list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
+    assert "does not match the requested workspace scope" in str(exc_ws.value)
+
+
+def test_premature_pagination_termination_raises_tool_error(mock_client):
+    """If backend reports total_count greater than collected items with next_page_results=False, raise ToolError."""
+    cycles = [
+        Cycle(id=f"c{i}", name=f"Cycle {i}", project=PROJECT_ID, workspace=WORKSPACE_SLUG, owned_by=OWNER_ID)
+        for i in range(5)
+    ]
+    # Incomplete page: 5 items, but total_count claims 10 and next_page_results is False
+    incomplete_page = make_cycle_standard_page(cycles, total_count=10, next_page_results=False)
+    mock_client.cycles.list.return_value = incomplete_page
+
+    with pytest.raises(ToolError) as exc_info:
+        list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
+    assert "listing incomplete: backend reported total=10 but only 5 items were collected" in str(exc_info.value)
 
 
 # ==============================================================================
@@ -660,8 +752,8 @@ def test_sdk_model_types_returned(mock_client):
     """Fallback returns genuine SDK PaginatedCycleLiteResponse and PaginatedModuleLiteResponse."""
     c = Cycle(id="c1", name="Cycle 1", project=PROJECT_ID, workspace=WORKSPACE_SLUG, owned_by=OWNER_ID)
     m = Module(id="m1", name="Module 1", project=PROJECT_ID, workspace=WORKSPACE_SLUG)
-    mock_client.cycles.list.return_value = [c]
-    mock_client.modules.list.return_value = [m]
+    mock_client.cycles.list.return_value = make_cycle_standard_page([c])
+    mock_client.modules.list.return_value = make_module_standard_page([m])
 
     cycle_res = list_cycles_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
     module_res = list_modules_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
@@ -744,7 +836,7 @@ def test_module_exact_output_schema_disallows_leaked_metrics(mock_client):
         unstarted_issues=5,
         cancelled_issues=0,
     )
-    mock_client.modules.list.return_value = [full_module]
+    mock_client.modules.list.return_value = make_module_standard_page([full_module])
 
     res = list_modules_ce(mock_client, WORKSPACE_SLUG, PROJECT_ID)
     dumped = res.results[0].model_dump()
@@ -783,6 +875,27 @@ async def test_raw_mcp_protocol_error_on_status_filter_under_ce(test_server, moc
             assert res.isError is True
             err_text = res.content[0].text
             assert "Filtering by status='upcoming' is not supported" in err_text
+            assert "retry without status" in err_text
+
+
+@pytest.mark.anyio
+async def test_raw_mcp_protocol_error_on_module_status_filter_under_ce(test_server, mock_client):
+    """End-to-end FastMCP protocol call returns isError=True when status is requested on CE module fallback."""
+    mock_client.modules.list_lite.side_effect = make_http_error(404, "Page not found")
+
+    with patch("plane_mcp.tools.module.get_plane_client_context", return_value=(mock_client, WORKSPACE_SLUG)):
+        async with Client(test_server) as client:
+            res = await client.call_tool_mcp(
+                "module",
+                {
+                    "action": "list",
+                    "project_id": PROJECT_ID,
+                    "status": "in-progress",
+                },
+            )
+            assert res.isError is True
+            err_text = res.content[0].text
+            assert "Filtering by status='in-progress' is not supported" in err_text
             assert "retry without status" in err_text
 
 

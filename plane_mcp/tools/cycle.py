@@ -6,6 +6,7 @@ from datetime import date, datetime
 from typing import Annotated, Any, Literal, get_args
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from plane.errors import HttpError
 from plane.models.cycles import (
     CreateCycle,
@@ -156,6 +157,8 @@ def register(mcp: FastMCP) -> None:
         client, workspace_slug = get_plane_client_context()
 
         if not project_id:
+            if action == "list":
+                raise ToolError(missing(action, "project_id"))
             return missing(action, "project_id")
 
         if action == "list":
