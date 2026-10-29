@@ -17,7 +17,7 @@ from plane.models.work_items import (
     WorkItemCountResponse,
 )
 
-from plane_mcp.ce_count import MAX_PAGES, MAX_PROJECTS, count_fallback
+from plane_mcp.ce_count import MAX_PAGES, MAX_PROJECTS, MAX_TRAVERSED_PROJECTS, count_fallback
 from plane_mcp.tools.workitem import register
 
 
@@ -697,6 +697,7 @@ async def test_raw_mcp_standalone_ce_silent_pql_ignore_explicit_pql_fails_closed
     with (
         patch("plane_mcp.tools.workitem.check_pql_capability", None),
         patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")),
+        patch.dict(os.environ, {"PLANE_SUPPORTS_PQL": "", "PLANE_CAPABILITY_PQL": ""}, clear=False),
     ):
         async with Client(test_server) as client_mcp:
             res = await client_mcp.call_tool_mcp(
@@ -705,6 +706,9 @@ async def test_raw_mcp_standalone_ce_silent_pql_ignore_explicit_pql_fails_closed
             )
             assert res.isError is True
             assert "Filtered counts are unavailable" in res.content[0].text
+            assert "Set PLANE_SUPPORTS_PQL=true" in res.content[0].text
+            assert "PR #259" not in res.content[0].text
+            assert "install PR" not in res.content[0].text
             assert not client.work_items.count_workspace.called
 
 
@@ -741,6 +745,7 @@ async def test_raw_mcp_standalone_ce_silent_pql_ignore_synthesized_project_pql_s
     with (
         patch("plane_mcp.tools.workitem.check_pql_capability", None),
         patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")),
+        patch.dict(os.environ, {"PLANE_SUPPORTS_PQL": "", "PLANE_CAPABILITY_PQL": ""}, clear=False),
     ):
         async with Client(test_server) as client_mcp:
             res = await client_mcp.call_tool_mcp(
@@ -878,6 +883,7 @@ async def test_raw_mcp_grouped_count_protocol_semantics(test_server: FastMCP):
     client_ce = MagicMock()
     client_ce.config.api_root = "http://ce.internal"
     with (
+        patch.dict(os.environ, {"PLANE_SUPPORTS_PQL": "", "PLANE_CAPABILITY_PQL": ""}, clear=False),
         patch("plane_mcp.tools.workitem.check_pql_capability", None),
         patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client_ce, "test-ws")),
     ):
@@ -892,6 +898,9 @@ async def test_raw_mcp_grouped_count_protocol_semantics(test_server: FastMCP):
             )
             assert res_ce.isError is True
             assert "Grouped counts are unavailable" in res_ce.content[0].text
+            assert "Set PLANE_SUPPORTS_PQL=true" in res_ce.content[0].text
+            assert "PR #259" not in res_ce.content[0].text
+            assert "install PR" not in res_ce.content[0].text
 
 
 @pytest.mark.anyio
@@ -945,3 +954,120 @@ async def test_raw_mcp_combined_pr259_pr261_protocol_semantics(test_server: Fast
             assert res_proj.isError is False
             data = json.loads(res_proj.content[0].text)
             assert data["total_count"] == 42
+
+
+# ============================================================================
+# Regression Tests for CodeRabbit Review Remediation
+# ============================================================================
+
+
+def test_count_fallback_mixed_active_and_archived_within_limits():
+    """Workspace with 90 active and 20 archived projects counts all 90 active projects cleanly."""
+    client = MagicMock()
+    # 90 active projects, 20 archived projects = 110 total traversed projects
+    active_projects = [MagicMock(id=f"active-{i}", archived_at=None) for i in range(90)]
+    archived_projects = [MagicMock(id=f"archived-{i}", archived_at="2026-01-01T00:00:00Z") for i in range(20)]
+    all_projects = active_projects + archived_projects
+    client.projects.list.return_value = MagicMock(results=all_projects, next_page_results=False)
+
+    # Each active project has total_count = 2 work items
+    client.work_items.list.return_value = MagicMock(total_count=2, results=[])
+
+    res = count_fallback(client, "test-ws")
+    assert res["total_count"] == 180  # 90 * 2
+    assert client.work_items.list.call_count == 90
+
+
+def test_count_fallback_boundary_exactly_100_active_projects():
+    """Workspace with exactly 100 active projects and 20 archived projects succeeds."""
+    client = MagicMock()
+    active_projects = [MagicMock(id=f"active-{i}", archived_at=None) for i in range(100)]
+    archived_projects = [MagicMock(id=f"archived-{i}", archived_at="2026-01-01T00:00:00Z") for i in range(20)]
+    all_projects = active_projects + archived_projects
+    client.projects.list.return_value = MagicMock(results=all_projects, next_page_results=False)
+
+    client.work_items.list.return_value = MagicMock(total_count=1, results=[])
+
+    res = count_fallback(client, "test-ws")
+    assert res["total_count"] == 100
+    assert client.work_items.list.call_count == 100
+
+
+def test_count_fallback_rejects_101_active_projects():
+    """Workspace with 101 active projects raises ToolError for active project scan limit."""
+    client = MagicMock()
+    active_projects = [MagicMock(id=f"active-{i}", archived_at=None) for i in range(101)]
+    archived_projects = [MagicMock(id=f"archived-{i}", archived_at="2026-01-01T00:00:00Z") for i in range(10)]
+    all_projects = active_projects + archived_projects
+    client.projects.list.return_value = MagicMock(results=all_projects, next_page_results=False)
+
+    with pytest.raises(ToolError) as exc_info:
+        count_fallback(client, "test-ws")
+
+    assert "active project scan limit" in str(exc_info.value)
+    assert "Specify an explicit project_id" in str(exc_info.value)
+
+
+def test_count_fallback_rejects_exceeded_traversal_limit():
+    """Workspace exceeding MAX_TRAVERSED_PROJECTS raises ToolError for traversal limit."""
+    client = MagicMock()
+    # 10 active projects + 250 archived projects = 260 traversed (> MAX_TRAVERSED_PROJECTS = 250)
+    active_projects = [MagicMock(id=f"active-{i}", archived_at=None) for i in range(10)]
+    archived_projects = [
+        MagicMock(id=f"archived-{i}", archived_at="2026-01-01T00:00:00Z") for i in range(MAX_TRAVERSED_PROJECTS)
+    ]
+    all_projects = active_projects + archived_projects
+    client.projects.list.return_value = MagicMock(results=all_projects, next_page_results=False)
+
+    with pytest.raises(ToolError) as exc_info:
+        count_fallback(client, "test-ws")
+
+    assert "traversed project scan limit" in str(exc_info.value)
+    assert "Specify an explicit project_id" in str(exc_info.value)
+
+
+def test_count_fallback_mixed_pagination_active_and_archived():
+    """Multi-page pagination with mixed active and archived projects counts active ones across pages."""
+    client = MagicMock()
+    page1_projects = [MagicMock(id=f"p1-act-{i}", archived_at=None) for i in range(50)] + [
+        MagicMock(id=f"p1-arc-{i}", archived_at="2026-01-01T00:00:00Z") for i in range(10)
+    ]
+    page2_projects = [MagicMock(id=f"p2-act-{i}", archived_at=None) for i in range(40)] + [
+        MagicMock(id=f"p2-arc-{i}", archived_at="2026-01-01T00:00:00Z") for i in range(10)
+    ]
+
+    page1 = MagicMock(results=page1_projects, next_page_results=True, next_cursor="cur-page-2")
+    page2 = MagicMock(results=page2_projects, next_page_results=False, next_cursor=None)
+    client.projects.list.side_effect = [page1, page2]
+    client.work_items.list.return_value = MagicMock(total_count=3, results=[])
+
+    res = count_fallback(client, "test-ws")
+    assert res["total_count"] == 270  # (50 + 40) * 3
+    assert client.work_items.list.call_count == 90
+
+
+@pytest.mark.anyio
+async def test_raw_mcp_pql_failure_preserves_is_error_true_and_guidance(test_server: FastMCP):
+    """Raw MCP: PQL syntax failure returns isError=true with actionable guidance and hint."""
+    client = MagicMock()
+    client.config.api_root = "https://api.plane.so"
+    client.work_items.count_workspace.side_effect = HttpError(
+        "Bad Request",
+        status_code=400,
+        response={"pql": "Invalid PQL syntax: unexpected token near 'invalid'"},
+    )
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")):
+        async with Client(test_server) as client_mcp:
+            res = await client_mcp.call_tool_mcp(
+                "workitem",
+                {"action": "count", "pql": "invalid syntax token"},
+            )
+            # Crucial MCP protocol contract: Must be an error, NOT isError=false
+            assert res.isError is True
+            err_msg = res.content[0].text
+            assert "Invalid PQL syntax" in err_msg
+            assert "Failed PQL: 'invalid syntax token'" in err_msg
+            assert "Fix it using the reference and retry workitem count" in err_msg
+            assert "Optional Plane Query Language (PQL) filter" in err_msg
+            assert "`get_pql_reference`" in err_msg

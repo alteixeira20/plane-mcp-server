@@ -395,20 +395,18 @@ def register(mcp: FastMCP) -> None:
                         "No fabricated count was returned."
                     )
             elif scoped and scoped.strip() and not _pql_capability_established(client):
-                # Standalone safety: When PR #259 is not installed and capability cannot be
-                # reliably established (e.g. self-hosted instance without PLANE_SUPPORTS_PQL=true),
-                # fail closed to prevent silent PQL ignore on older CE backends.
+                # Standalone safety: When capability cannot be reliably established (e.g. self-hosted
+                # instance without PLANE_SUPPORTS_PQL=true), fail closed to prevent silent PQL ignore
+                # on older CE backends.
                 if group_by or sub_group_by:
                     raise ToolError(
                         "Grouped counts are unavailable through this Plane public API. "
                         "Project-scoped grouped counts rely on PQL filtering, which is unavailable on unverified "
-                        "self-hosted Plane backends without PR #259 capability detection. Set PLANE_SUPPORTS_PQL=true "
-                        "if your instance supports PQL, or install PR #259."
+                        "self-hosted Plane backends. Set PLANE_SUPPORTS_PQL=true if your instance supports PQL."
                     )
                 raise ToolError(
-                    "Filtered counts are unavailable with explicit PQL on unverified self-hosted Plane backends "
-                    "without PR #259 capability detection. Set PLANE_SUPPORTS_PQL=true if your instance supports "
-                    "PQL, or install PR #259."
+                    "Filtered counts are unavailable with explicit PQL on unverified self-hosted Plane backends. "
+                    "Set PLANE_SUPPORTS_PQL=true if your instance supports PQL."
                 )
 
             try:
@@ -421,8 +419,10 @@ def register(mcp: FastMCP) -> None:
             except HttpError as exc:
                 failure = pql_failure("workitem", action, scoped, exc)
                 if failure:
+                    hint = failure.get("hint", "")
+                    pql_guide = f" Reference: {PQL_FIELD_HINT}" if PQL_FIELD_HINT else ""
                     raise ToolError(
-                        f"{failure['error']} Failed PQL: {failure['failed_pql']!r}. {failure['hint']}"
+                        f"{failure['error']} Failed PQL: {failure['failed_pql']!r}. {hint}{pql_guide}"
                     ) from exc
                 if exc.status_code != 404:
                     raise

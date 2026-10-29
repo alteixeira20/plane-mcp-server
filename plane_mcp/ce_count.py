@@ -9,6 +9,7 @@ from plane.errors.errors import HttpError
 from plane.models.query_params import PaginatedQueryParams, WorkItemQueryParams
 
 MAX_PROJECTS = 100
+MAX_TRAVERSED_PROJECTS = 250
 MAX_PAGES = 10
 
 
@@ -58,9 +59,14 @@ def _workspace_project_ids(client: Any, slug: str) -> list[str]:
             seen_ids.add(pid)
             if getattr(project, "archived_at", None) is None:
                 ids.append(pid)
-            if len(seen_ids) > MAX_PROJECTS:
+            if len(ids) > MAX_PROJECTS:
                 raise ToolError(
-                    f"CE workspace count exceeds {MAX_PROJECTS} project scan limit. "
+                    f"CE workspace count exceeds {MAX_PROJECTS} active project scan limit. "
+                    "Specify an explicit project_id to count individual projects."
+                )
+            if len(seen_ids) > MAX_TRAVERSED_PROJECTS:
+                raise ToolError(
+                    f"CE workspace count exceeds {MAX_TRAVERSED_PROJECTS} traversed project scan limit. "
                     "Specify an explicit project_id to count individual projects."
                 )
         if not next_page:
@@ -91,7 +97,8 @@ def count_fallback(client: Any, workspace_slug: str, project_id: str = "") -> di
 
     Bound constraints & outbound requests:
     - Max project pages: MAX_PAGES (10).
-    - Max projects scanned: MAX_PROJECTS (100).
+    - Max active projects scanned: MAX_PROJECTS (100).
+    - Max traversed projects: MAX_TRAVERSED_PROJECTS (250).
     - Max outbound requests: 1 (count attempt) + 10 (projects) + 100 (workitems) = 111.
     """
     if project_id:
