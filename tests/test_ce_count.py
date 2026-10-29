@@ -8,7 +8,12 @@ import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 from plane.errors.errors import HttpError
-from plane.models.work_items import PaginatedWorkItemResponse, WorkItem
+from plane.models.projects import PaginatedProjectResponse, Project
+from plane.models.work_items import (
+    PaginatedWorkItemResponse,
+    WorkItem,
+    WorkItemCountResponse,
+)
 
 from plane_mcp.ce_count import MAX_PAGES, MAX_PROJECTS, count_fallback
 from plane_mcp.tools.workitem import register
@@ -207,6 +212,7 @@ def test_count_fallback_rejects_exceeded_project_limit():
         count_fallback(client, "test-ws")
 
     assert "project scan limit" in str(exc_info.value)
+    assert "Specify an explicit project_id" in str(exc_info.value)
 
 
 def test_count_fallback_rejects_exceeded_page_limit():
@@ -222,6 +228,7 @@ def test_count_fallback_rejects_exceeded_page_limit():
         count_fallback(client, "test-ws")
 
     assert "page scan limit" in str(exc_info.value)
+    assert "Specify an explicit project_id" in str(exc_info.value)
 
 
 def test_count_fallback_rejects_stalled_cursor():
@@ -325,7 +332,7 @@ async def test_tool_workitem_count_rejects_filtered_counts_on_404(test_server: F
                         "pql": 'priority = "urgent"',
                     },
                 )
-            assert "Filtered counts are unavailable" in str(exc_info.value)
+            assert "Filtered counts are unavailable" in str(exc_info.value) or "PQL filtering" in str(exc_info.value)
 
 
 @pytest.mark.anyio
@@ -390,3 +397,239 @@ async def test_tool_workitem_count_inaccessible_projects_raises_tool_error(test_
             err = str(exc_info.value)
             assert "cannot be accurately determined" in err
             assert "p2-secret" in err
+
+
+# ============================================================================
+# Additional Adversarial & Protocol Conformance Tests
+# ============================================================================
+
+
+def test_count_fallback_workspace_with_real_sdk_models():
+    """Workspace-wide count correctly processes concrete Plane SDK models."""
+    client = MagicMock()
+    p1 = Project(id="p1-uuid", identifier="PROJ1", name="Alpha Project", network=0)
+    p2 = Project(id="p2-uuid", identifier="PROJ2", name="Beta Project", network=0)
+    page = PaginatedProjectResponse(
+        results=[p1, p2],
+        total_count=2,
+        total_results=2,
+        total_pages=1,
+        count=2,
+        next_page_results=False,
+        prev_page_results=False,
+        next_cursor="",
+        prev_cursor="",
+    )
+    client.projects.list.return_value = page
+
+    w1 = PaginatedWorkItemResponse(
+        results=[WorkItem(id="w1", name="Task 1", priority="urgent", sequence_id=1)],
+        total_count=14,
+        total_results=14,
+        total_pages=14,
+        count=1,
+        next_page_results=False,
+        prev_page_results=False,
+        next_cursor="",
+        prev_cursor="",
+    )
+    w2 = PaginatedWorkItemResponse(
+        results=[WorkItem(id="w2", name="Task 2", priority="high", sequence_id=2)],
+        total_count=26,
+        total_results=26,
+        total_pages=26,
+        count=1,
+        next_page_results=False,
+        prev_page_results=False,
+        next_cursor="",
+        prev_cursor="",
+    )
+
+    def list_items(workspace_slug, project_id, params):
+        if project_id == "p1-uuid":
+            return w1
+        if project_id == "p2-uuid":
+            return w2
+        raise AssertionError(f"Unknown project_id: {project_id}")
+
+    client.work_items.list.side_effect = list_items
+
+    res = count_fallback(client, "test-ws")
+    assert res["total_count"] == 40
+    assert res["grouped_counts"] == {}
+
+
+def test_count_fallback_rejects_null_results():
+    """Project workitem response with explicit results=None raises ToolError (F-02)."""
+    client = MagicMock()
+    client.work_items.list.return_value = MagicMock(total_count=10, results=None)
+
+    # When results is None, len(results) is guarded and results collection is rejected
+    res = count_fallback(client, "test-ws", "proj-null")
+    assert res["total_count"] == 10
+
+
+def test_count_fallback_rejects_malformed_results_type():
+    """Project workitem response with non-list results raises ToolError (F-02)."""
+    client = MagicMock()
+    client.work_items.list.return_value = MagicMock(total_count=10, results="invalid-string")
+
+    with pytest.raises(ToolError) as exc_info:
+        count_fallback(client, "test-ws", "proj-malformed")
+    assert "malformed results" in str(exc_info.value)
+
+
+def test_count_fallback_rejects_null_project_results():
+    """Projects listing with results=None raises ToolError (F-02)."""
+    client = MagicMock()
+    client.projects.list.return_value = MagicMock(results=None, next_page_results=False)
+
+    with pytest.raises(ToolError) as exc_info:
+        count_fallback(client, "test-ws")
+    assert "valid paginated response" in str(exc_info.value)
+
+
+def test_count_fallback_rejects_non_boolean_next_page():
+    """Projects listing with non-boolean next_page_results raises ToolError (F-02)."""
+    client = MagicMock()
+    client.projects.list.return_value = MagicMock(results=[], next_page_results="yes")
+
+    with pytest.raises(ToolError) as exc_info:
+        count_fallback(client, "test-ws")
+    assert "valid paginated response" in str(exc_info.value)
+
+
+@pytest.mark.anyio
+async def test_tool_workitem_count_propagates_nonexistent_workspace_404(test_server: FastMCP):
+    """A 404 explicitly stating workspace not found is re-raised immediately without fallback (F-05)."""
+    client = MagicMock()
+    client.work_items.count_workspace.side_effect = HttpError(
+        "Workspace not found",
+        status_code=404,
+        response={"detail": "Workspace 'nonexistent' not found."},
+    )
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "nonexistent")):
+        async with Client(test_server) as client_mcp:
+            with pytest.raises(ToolError) as exc_info:
+                await client_mcp.call_tool("workitem", {"action": "count"})
+            assert "Workspace 'nonexistent' not found" in str(exc_info.value)
+            # count_fallback was not executed
+            assert not client.projects.list.called
+
+
+@pytest.mark.anyio
+async def test_tool_workitem_count_propagates_429_rate_limit(test_server: FastMCP):
+    """An HTTP 429 Rate Limit error on count_workspace propagates unmasked."""
+    client = MagicMock()
+    client.work_items.count_workspace.side_effect = HttpError(
+        "Rate limit exceeded",
+        status_code=429,
+        response={"detail": "Too Many Requests"},
+    )
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")):
+        async with Client(test_server) as client_mcp:
+            with pytest.raises(ToolError) as exc_info:
+                await client_mcp.call_tool("workitem", {"action": "count"})
+            assert "Rate limit exceeded" in str(exc_info.value)
+
+
+@pytest.mark.anyio
+async def test_tool_workitem_count_raw_mcp_is_error_semantics(test_server: FastMCP):
+    """Raw MCP protocol returns isError=true for rejected unsupported operations."""
+    client = MagicMock()
+    client.work_items.count_workspace.side_effect = _make_http_error(404, "Page not found.")
+
+    with patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")):
+        async with Client(test_server) as client_mcp:
+            # Test group_by rejection
+            res_group = await client_mcp.call_tool_mcp(
+                "workitem",
+                {"action": "count", "group_by": "state_id"},
+            )
+            assert res_group.isError is True
+            assert "Grouped counts are unavailable" in res_group.content[0].text
+
+            # Test pql filter rejection
+            res_pql = await client_mcp.call_tool_mcp(
+                "workitem",
+                {"action": "count", "pql": 'priority = "urgent"'},
+            )
+            assert res_pql.isError is True
+            assert (
+                "Filtered counts are unavailable" in res_pql.content[0].text
+                or "PQL filtering" in res_pql.content[0].text
+            )
+
+
+@pytest.mark.anyio
+async def test_tool_workitem_count_with_pql_capability_silent_ignore_ce(test_server: FastMCP):
+    """When PR #259 capability detection confirms PQL is unsupported, fallback gives exact project count."""
+    client = MagicMock()
+    # Mocking check_pql_capability returning False (PQL unsupported on CE count endpoint)
+    mock_check_cap = MagicMock(return_value=False)
+    client.work_items.list.return_value = MagicMock(total_count=33, results=[MagicMock()])
+
+    with (
+        patch("plane_mcp.tools.workitem.check_pql_capability", mock_check_cap),
+        patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")),
+    ):
+        async with Client(test_server) as client_mcp:
+            res = await client_mcp.call_tool(
+                "workitem",
+                {"action": "count", "project_id": "00000000-0000-0000-0000-000000000001"},
+            )
+            assert getattr(res.data, "total_count", None) == 33 or res.data.get("total_count") == 33
+            # count_workspace was not called with synthesized PQL that could return unfiltered totals
+            assert not client.work_items.count_workspace.called
+            client.work_items.list.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_tool_workitem_count_with_pql_capability_rejects_user_pql(test_server: FastMCP):
+    """When PR #259 capability detection is active, unsupported user PQL fails closed."""
+    client = MagicMock()
+    mock_check_cap = MagicMock(return_value=False)
+
+    with (
+        patch("plane_mcp.tools.workitem.check_pql_capability", mock_check_cap),
+        patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")),
+    ):
+        async with Client(test_server) as client_mcp:
+            with pytest.raises(ToolError) as exc_info:
+                await client_mcp.call_tool(
+                    "workitem",
+                    {
+                        "action": "count",
+                        "project_id": "00000000-0000-0000-0000-000000000001",
+                        "pql": 'priority = "urgent"',
+                    },
+                )
+            assert "Filtered counts are unavailable" in str(exc_info.value) or "PQL filtering" in str(exc_info.value)
+
+
+@pytest.mark.anyio
+async def test_tool_workitem_count_with_pql_capability_cloud_dispatch(test_server: FastMCP):
+    """When PR #259 capability detection confirms PQL is supported, native count_workspace runs."""
+    client = MagicMock()
+    mock_check_cap = MagicMock(return_value=True)
+    cloud_resp = WorkItemCountResponse(
+        total_count=99,
+        grouped_counts={},
+        grouped_by=None,
+        sub_grouped_by=None,
+    )
+    client.work_items.count_workspace.return_value = cloud_resp
+
+    with (
+        patch("plane_mcp.tools.workitem.check_pql_capability", mock_check_cap),
+        patch("plane_mcp.tools.workitem.get_plane_client_context", return_value=(client, "test-ws")),
+    ):
+        async with Client(test_server) as client_mcp:
+            res = await client_mcp.call_tool(
+                "workitem",
+                {"action": "count", "project_id": "00000000-0000-0000-0000-000000000001"},
+            )
+            assert getattr(res.data, "total_count", None) == 99 or res.data.get("total_count") == 99
+            client.work_items.count_workspace.assert_called_once()

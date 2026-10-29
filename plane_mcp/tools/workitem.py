@@ -46,6 +46,12 @@ from plane_mcp.toolkit import (
     rich_text,
 )
 
+try:
+    from plane_mcp.toolkit import check_pql_capability, reject_ce_pql  # type: ignore[attr-defined]
+except (ImportError, AttributeError):
+    check_pql_capability = None  # type: ignore[assignment]
+    reject_ce_pql = None  # type: ignore[assignment]
+
 logger = get_logger(__name__)
 
 NAME = "workitem"
@@ -312,7 +318,40 @@ def register(mcp: FastMCP) -> None:
             return envelope(response, opt(fields))
 
         if action == "count":
+            has_user_pql = bool(pql and pql.strip())
             scoped = _scoped_pql(pql, project_id)
+
+            # Integration with PQL capability detection (e.g. PR #259)
+            if callable(check_pql_capability) and scoped and scoped.strip():
+                if not check_pql_capability(
+                    client,
+                    workspace_slug,
+                    project_id=project_id,
+                    surface="workitem.count",
+                    probe_fn=lambda: client.work_items.count_workspace(
+                        workspace_slug=workspace_slug,
+                        params=WorkItemCountQueryParams(pql="(((pql_probe_syntax_check"),
+                    ),
+                ):
+                    # PQL filtering is not supported on this count endpoint.
+                    if group_by or sub_group_by:
+                        raise ToolError(
+                            "Grouped counts are unavailable through this Plane public API. "
+                            "No fabricated count was returned."
+                        )
+                    if not has_user_pql and project_id:
+                        # Project-scoped count can be accurately resolved via project-listing fallback
+                        return count_fallback(client, workspace_slug, project_id)
+                    if callable(reject_ce_pql):
+                        reject_ce_pql(
+                            scoped,
+                            reason="PQL filtering is not supported on workitem.count in Plane CE.",
+                        )
+                    raise ToolError(
+                        "Filtered counts are unavailable when this Plane server's count endpoint does not support PQL. "
+                        "No fabricated count was returned."
+                    )
+
             try:
                 response = client.work_items.count_workspace(
                     workspace_slug=workspace_slug,
@@ -323,15 +362,21 @@ def register(mcp: FastMCP) -> None:
             except HttpError as exc:
                 failure = pql_failure("workitem", action, scoped, exc)
                 if failure:
-                    return failure
+                    raise ToolError(
+                        f"{failure['error']} Failed PQL: {failure['failed_pql']!r}. {failure['hint']}"
+                    ) from exc
                 if exc.status_code != 404:
+                    raise
+                # F-05: Distinguish missing count route from non-existent workspace entity
+                resp_detail = str(exc.response).lower() if exc.response is not None else ""
+                if "workspace" in resp_detail and "not found" in resp_detail:
                     raise
                 if group_by or sub_group_by:
                     raise ToolError(
                         "Grouped counts are unavailable through this Plane public API. "
                         "No fabricated count was returned."
                     ) from exc
-                if pql and pql.strip():
+                if has_user_pql:
                     raise ToolError(
                         "Filtered counts are unavailable when this Plane server's count endpoint is missing. "
                         "No fabricated count was returned."

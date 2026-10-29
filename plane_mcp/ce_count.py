@@ -13,7 +13,12 @@ MAX_PAGES = 10
 
 
 def _project_total(client: Any, slug: str, project_id: str) -> int:
-    """Read the reliable total_count from a project work-item listing."""
+    """Read the authoritative total_count from a project work-item listing.
+
+    Issues a single DRF listing request with per_page=1. DRF computes total_count
+    via a database COUNT query filtered by project_id, providing an exact
+    single-query snapshot for the project.
+    """
     response = client.work_items.list(
         workspace_slug=slug,
         project_id=project_id,
@@ -22,9 +27,12 @@ def _project_total(client: Any, slug: str, project_id: str) -> int:
     total = getattr(response, "total_count", None)
     if not isinstance(total, int) or isinstance(total, bool) or total < 0:
         raise ToolError(f"CE project '{project_id}' work-item response has no trustworthy total_count.")
-    results = getattr(response, "results", [])
-    if len(results) > total:
-        raise ToolError(f"CE project '{project_id}' work-item response contradicts total_count.")
+    results = getattr(response, "results", None)
+    if results is not None:
+        if not isinstance(results, (list, tuple)):
+            raise ToolError(f"CE project '{project_id}' work-item response has malformed results collection.")
+        if len(results) > total:
+            raise ToolError(f"CE project '{project_id}' work-item response contradicts total_count.")
     return total
 
 
@@ -39,9 +47,11 @@ def _workspace_project_ids(client: Any, slug: str) -> list[str]:
             workspace_slug=slug,
             params=PaginatedQueryParams(per_page=100, cursor=cursor),
         )
-        if not hasattr(page, "results") or not hasattr(page, "next_page_results"):
+        results = getattr(page, "results", None)
+        next_page = getattr(page, "next_page_results", None)
+        if results is None or not isinstance(results, (list, tuple)) or not isinstance(next_page, bool):
             raise ToolError("CE project API did not return a valid paginated response.")
-        for project in page.results:
+        for project in results:
             pid = getattr(project, "id", None)
             if not pid or pid in seen_ids:
                 raise ToolError("CE project pagination repeated or omitted a project ID.")
@@ -49,19 +59,41 @@ def _workspace_project_ids(client: Any, slug: str) -> list[str]:
             if getattr(project, "archived_at", None) is None:
                 ids.append(pid)
             if len(seen_ids) > MAX_PROJECTS:
-                raise ToolError(f"CE workspace count exceeds {MAX_PROJECTS} project scan limit.")
-        if not page.next_page_results:
+                raise ToolError(
+                    f"CE workspace count exceeds {MAX_PROJECTS} project scan limit. "
+                    "Specify an explicit project_id to count individual projects."
+                )
+        if not next_page:
             return ids
         following = getattr(page, "next_cursor", None)
-        if not following or following in seen_cursors or not page.results:
+        if not following or following in seen_cursors or not results:
             raise ToolError("CE project pagination stalled during count scan.")
         seen_cursors.add(following)
         cursor = following
-    raise ToolError(f"CE workspace count exceeded {MAX_PAGES} page scan limit.")
+    raise ToolError(
+        f"CE workspace count exceeded {MAX_PAGES} page scan limit. "
+        "Specify an explicit project_id to count individual projects."
+    )
 
 
 def count_fallback(client: Any, workspace_slug: str, project_id: str = "") -> dict[str, Any]:
-    """Accurate unfiltered, ungrouped project or workspace count fallback."""
+    """Accurate unfiltered, ungrouped project or workspace count fallback.
+
+    Note on snapshot semantics:
+    - Project-scoped count (project_id provided) performs a single request to
+      the project's DRF work-item list endpoint with per_page=1, obtaining an
+      atomic database COUNT snapshot for that project.
+    - Workspace-wide count (project_id omitted) is a bounded, best-effort aggregate
+      computed across multiple sequential HTTP requests (up to MAX_PAGES project
+      listing pages + up to MAX_PROJECTS individual project counts). It is not an
+      ACID snapshot-isolated transaction; concurrent writes across projects during
+      the scan window can result in slight count drift.
+
+    Bound constraints & outbound requests:
+    - Max project pages: MAX_PAGES (10).
+    - Max projects scanned: MAX_PROJECTS (100).
+    - Max outbound requests: 1 (count attempt) + 10 (projects) + 100 (workitems) = 111.
+    """
     if project_id:
         total = _project_total(client, workspace_slug, project_id)
         return {
